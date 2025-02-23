@@ -1,4 +1,4 @@
-# Duplicate File Finder
+# mddedupe - Duplicate File Finder
 
 A high-performance command-line tool written in Rust for finding and managing duplicate files in a directory tree. The tool uses parallel processing and efficient hashing algorithms to quickly identify duplicates while providing various options for handling them.
 
