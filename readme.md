@@ -302,28 +302,14 @@ After sorting:
 
 ## Architecture
 
-### Technology Stack
+For detailed architecture documentation including algorithm details, key functions, testing strategy, error handling, performance characteristics, and platform-specific code, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-| Component | Library | Purpose |
-|-----------|---------|---------|
-| CLI Parsing | clap 4.x | Argument parsing with derive API |
-| Parallel Processing | rayon 1.7 | Data-parallel hashing |
-| Hashing | sha2 0.10 | SHA-256 cryptographic hash |
-| Directory Traversal | walkdir 2.3 | Recursive filesystem scanning |
-| Cancellation | ctrlc 3 | Ctrl+C signal handling |
-| Serialization | serde 1.0, serde_json 1.0 | JSON output |
-| Trash (Windows) | trash 3 | Recycle bin integration |
-
-### Code Organization
+### Quick Summary
 
 - **Single-file design**: All code in `src/main.rs` (~1,800 lines)
-- **Functional decomposition**: Clear separation of concerns despite single-file structure
+- **Two-stage algorithm**: Size grouping → SHA-256 hashing (only candidates)
+- **Parallel processing**: Rayon for multi-core hashing
 - **Test coverage**: 91.9% line coverage, 93.2% function coverage
-- **Platform abstraction**: Conditional compilation for OS-specific features
-
-For detailed architecture documentation, see:
-- `CLAUDE.md` - Developer guide for working with this codebase
-- `wrk_docs/2025.11.06 - Comprehensive Architecture Analysis.md` - Complete technical analysis
 
 ## Safety Features
 
