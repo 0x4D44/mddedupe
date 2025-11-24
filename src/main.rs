@@ -3,7 +3,7 @@ use ctrlc;
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -14,6 +14,20 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FileId {
+    #[cfg(unix)]
+    Unix { dev: u64, ino: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume: u64,
+        index_high: u64,
+        index_low: u64,
+    },
+    #[cfg(not(any(unix, windows)))]
+    Path(String),
+}
 
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CTRL_C_ONCE: Once = Once::new();
@@ -70,6 +84,10 @@ struct Args {
     /// Logging verbosity for duplicate listings and action progress.
     #[arg(long, value_enum, default_value = "info")]
     log_level: LogLevel,
+
+    /// Treat per-file action failures as fatal and return a non-zero exit code when any occur.
+    #[arg(long)]
+    fail_on_error: bool,
 }
 
 /// Converts a file size in bytes to a human‐readable string with appropriate units.
@@ -119,20 +137,51 @@ fn reset_cancellation_flag() {
 const DEFAULT_SCAN_PROGRESS_MS: u64 = 1_000;
 const DEFAULT_HASH_PROGRESS_MS: u64 = 500;
 
-fn read_duration_from_env(var: &str, default_ms: u64) -> Duration {
-    env::var(var)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(default_ms))
+fn file_id_from_metadata(path: &Path, metadata: &fs::Metadata) -> FileId {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        return FileId::Unix {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let _ = path;
+        return FileId::Windows {
+            volume: metadata.volume_serial_number(),
+            index_high: metadata.file_index_high(),
+            index_low: metadata.file_index_low(),
+        };
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        return FileId::Path(canonical.to_string_lossy().into_owned());
+    }
 }
 
-fn scan_progress_interval() -> Duration {
+fn read_duration_from_env(var: &str, default_ms: u64) -> Option<Duration> {
+    match env::var(var) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => Some(Duration::from_millis(default_ms)),
+        },
+        Err(_) => Some(Duration::from_millis(default_ms)),
+    }
+}
+
+fn scan_progress_interval() -> Option<Duration> {
     read_duration_from_env("MDDEDUPE_SCAN_PROGRESS_MS", DEFAULT_SCAN_PROGRESS_MS)
 }
 
-fn hash_progress_sleep() -> Duration {
+fn hash_progress_sleep() -> Option<Duration> {
     read_duration_from_env("MDDEDUPE_HASH_PROGRESS_MS", DEFAULT_HASH_PROGRESS_MS)
 }
 
@@ -180,10 +229,45 @@ fn find_duplicates_optimized_with_options(
     let mut scanned_files = 0usize;
     let mut last_update = Instant::now();
     let scan_interval = scan_progress_interval();
-    let progress_allowed = Arc::new(AtomicBool::new(show_progress));
+    let progress_allowed = Arc::new(AtomicBool::new(show_progress && scan_interval.is_some()));
 
     // Stage 1: Walk the directory and group files by their size.
-    for entry in WalkDir::new(dir).follow_links(follow_symlinks) {
+    let walker: Box<dyn Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>>> =
+        if follow_symlinks {
+            let mut visited: HashSet<FileId> = HashSet::new();
+            Box::new(
+                WalkDir::new(dir)
+                    .follow_links(true)
+                    .into_iter()
+                    .filter_entry(move |entry| {
+                        let file_type = entry.file_type();
+                        if !(file_type.is_dir() || file_type.is_symlink()) {
+                            return true;
+                        }
+                        match entry.path().metadata() {
+                            Ok(metadata) => {
+                                if !metadata.is_dir() {
+                                    return true;
+                                }
+                                let id = file_id_from_metadata(entry.path(), &metadata);
+                                visited.insert(id)
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "Warning: unable to read metadata for {}: {}",
+                                    entry.path().display(),
+                                    err
+                                );
+                                false
+                            }
+                        }
+                    }),
+            )
+        } else {
+            Box::new(WalkDir::new(dir).follow_links(false).into_iter())
+        };
+
+    for entry in walker {
         if cancellation_requested() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -208,7 +292,9 @@ fn find_duplicates_optimized_with_options(
         }
         if show_progress
             && progress_allowed.load(Ordering::SeqCst)
-            && last_update.elapsed() >= scan_interval
+            && scan_interval
+                .map(|interval| last_update.elapsed() >= interval)
+                .unwrap_or(false)
         {
             let message = format!("\rScanning filesystem - found {} files...", scanned_files);
             handle_progress_result(write_progress_line(&message), &progress_allowed)?;
@@ -247,9 +333,10 @@ fn find_duplicates_optimized_with_options(
     let candidate_processed = Arc::new(AtomicUsize::new(0));
     let hash_sleep = hash_progress_sleep();
 
-    let progress_handle = if show_progress && candidate_total > 0 {
+    let progress_handle = if show_progress && candidate_total > 0 && hash_sleep.is_some() {
         let candidate_processed_clone = candidate_processed.clone();
         let progress_allowed_clone = progress_allowed.clone();
+        let sleep_duration = hash_sleep.unwrap();
         Some(std::thread::spawn(move || {
             loop {
                 if !progress_allowed_clone.load(Ordering::SeqCst) {
@@ -272,7 +359,7 @@ fn find_duplicates_optimized_with_options(
                 if processed >= candidate_total {
                     break;
                 }
-                std::thread::sleep(hash_sleep);
+                std::thread::sleep(sleep_duration);
             }
             if progress_allowed_clone.load(Ordering::SeqCst) {
                 let _ = write_progress_line("\n");
@@ -639,6 +726,7 @@ enum AppError {
     CtrlCSetup(String),
     Cancelled,
     UnknownAction(String),
+    ActionFailures(usize),
 }
 
 impl From<io::Error> for AppError {
@@ -937,6 +1025,18 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
                     );
                 }
             }
+            let sample_paths: Vec<String> = report
+                .failures
+                .iter()
+                .take(3)
+                .map(|failure| failure.path.display().to_string())
+                .collect();
+            eprintln!(
+                "Action completed with {} failures (showing {}): {}",
+                report.failures.len(),
+                sample_paths.len(),
+                sample_paths.join(", ")
+            );
             for failure in &report.failures {
                 summary_lines.push(format!(
                     "Failure: {} ({}): {}",
@@ -944,6 +1044,9 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
                     human_readable(failure.size),
                     failure.error
                 ));
+            }
+            if args.fail_on_error {
+                return Err(AppError::ActionFailures(report.failures.len()));
             }
         }
     } else {
@@ -1048,6 +1151,13 @@ fn main() -> io::Result<()> {
             );
             process::exit(1);
         }
+        Err(AppError::ActionFailures(count)) => {
+            eprintln!(
+                "Encountered {} action failures; exiting with error as requested.",
+                count
+            );
+            process::exit(2);
+        }
     }
 }
 
@@ -1075,8 +1185,8 @@ mod tests {
     }
 
     fn set_progress_env() {
-        env::set_var("MDDEDUPE_SCAN_PROGRESS_MS", "0");
-        env::set_var("MDDEDUPE_HASH_PROGRESS_MS", "0");
+        env::set_var("MDDEDUPE_SCAN_PROGRESS_MS", "1");
+        env::set_var("MDDEDUPE_HASH_PROGRESS_MS", "1");
     }
 
     #[test]
@@ -1093,6 +1203,113 @@ mod tests {
         let minutes = Duration::from_secs(125);
         assert_eq!(format_duration(seconds), "42 sec");
         assert_eq!(format_duration(minutes), "2 min 5 sec");
+    }
+
+    #[test]
+    fn test_action_failures_trigger_error_when_requested() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        let file1 = dir.join("file1.txt");
+        let file2 = dir.join("file2.txt");
+        fs::write(&file1, b"duplicate").expect("write file1");
+        fs::write(&file2, b"duplicate").expect("write file2");
+
+        // Destination is unwritable to force failures.
+        let dest_dir = TempDir::new().expect("dest tempdir");
+        let dest_path = dest_dir.path();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(dest_path)
+                .expect("dest metadata")
+                .permissions();
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o555);
+            fs::set_permissions(dest_path, perms).expect("set perms");
+        }
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(dest_path.to_path_buf()),
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            summary_format: SummaryFormat::Text,
+            fail_on_error: true,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(matches!(result, Err(AppError::ActionFailures(count)) if count >= 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_follow_symlinks_cycle_does_not_hang() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+
+        // Create a symlink that points back to the root of the temp directory.
+        let loop_path = temp_dir.path().join("loop");
+        symlink(temp_dir.path(), &loop_path).expect("Failed to create self-referential symlink");
+
+        let result = find_duplicates_optimized_with_options(temp_dir.path(), true, true, true)
+            .expect("Scan with symlink loop should complete");
+        let (_, scanned, dup_count, wasted, _) = result;
+        assert_eq!(scanned, 0);
+        assert_eq!(dup_count, 0);
+        assert_eq!(wasted, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_follow_symlinks_missing_target_skips_safely() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+
+        let broken = temp_dir.path().join("broken");
+        symlink(temp_dir.path().join("missing"), &broken).expect("Failed to create broken symlink");
+
+        let result = find_duplicates_optimized_with_options(temp_dir.path(), true, true, true)
+            .expect("Scan with broken symlink should complete");
+        let (_, scanned, dup_count, wasted, _) = result;
+        assert_eq!(scanned, 0);
+        assert_eq!(dup_count, 0);
+        assert_eq!(wasted, 0);
+    }
+
+    #[test]
+    fn test_progress_env_zero_disables_progress() {
+        env::set_var("MDDEDUPE_SCAN_PROGRESS_MS", "0");
+        env::set_var("MDDEDUPE_HASH_PROGRESS_MS", "0");
+        assert!(scan_progress_interval().is_none());
+        assert!(hash_progress_sleep().is_none());
+        env::remove_var("MDDEDUPE_SCAN_PROGRESS_MS");
+        env::remove_var("MDDEDUPE_HASH_PROGRESS_MS");
+    }
+
+    #[test]
+    fn test_progress_env_one_ms_respected() {
+        env::set_var("MDDEDUPE_SCAN_PROGRESS_MS", "1");
+        env::set_var("MDDEDUPE_HASH_PROGRESS_MS", "1");
+        assert_eq!(
+            scan_progress_interval().expect("scan interval"),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            hash_progress_sleep().expect("hash sleep"),
+            Duration::from_millis(1)
+        );
+        env::remove_var("MDDEDUPE_SCAN_PROGRESS_MS");
+        env::remove_var("MDDEDUPE_HASH_PROGRESS_MS");
     }
 
     #[test]
@@ -1246,6 +1463,7 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
+            fail_on_error: false,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -1296,6 +1514,7 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
+            fail_on_error: false,
         };
 
         let result = run_app(args, Cursor::new(b"n\n".to_vec()));
@@ -1328,6 +1547,7 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
+            fail_on_error: false,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -1371,6 +1591,7 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
+            fail_on_error: false,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -1427,6 +1648,7 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
+            fail_on_error: false,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -1458,6 +1680,7 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
+            fail_on_error: false,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -1489,6 +1712,7 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
+            fail_on_error: false,
         };
 
         let trash_dir = TempDir::new().expect("Failed to create trash directory");
@@ -1531,6 +1755,7 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
+            fail_on_error: false,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -1559,6 +1784,7 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
+            fail_on_error: false,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
