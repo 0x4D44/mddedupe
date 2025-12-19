@@ -634,7 +634,6 @@ fn relocate_file(src: &Path, dest: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(windows))]
 fn resolve_trash_destination() -> io::Result<PathBuf> {
     if let Ok(custom) = env::var("MDD_TRASH_DIR") {
         let dir = PathBuf::from(custom);
@@ -672,22 +671,27 @@ fn resolve_trash_destination() -> io::Result<PathBuf> {
 }
 
 fn send_to_trash(path: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        trash::delete(path).map_err(|err| io::Error::other(err.to_string()))
-    }
-
-    #[cfg(not(windows))]
-    {
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file name"))?;
-        let trash_dir = resolve_trash_destination()?;
-        let mut dest_path = trash_dir.join(file_name);
-        if dest_path.exists() {
-            dest_path = get_unique_destination(&trash_dir, file_name);
+    match resolve_trash_destination() {
+        Ok(trash_dir) => {
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file name"))?;
+            let mut dest_path = trash_dir.join(file_name);
+            if dest_path.exists() {
+                dest_path = get_unique_destination(&trash_dir, file_name);
+            }
+            relocate_file(path, &dest_path)
         }
-        relocate_file(path, &dest_path)
+        Err(_err) => {
+            #[cfg(windows)]
+            {
+                trash::delete(path).map_err(|e| io::Error::other(e.to_string()))
+            }
+            #[cfg(not(windows))]
+            {
+                Err(_err)
+            }
+        }
     }
 }
 
@@ -1203,6 +1207,18 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             perms.set_mode(0o555);
             fs::set_permissions(dest_path, perms).expect("set perms");
+        }
+        #[cfg(windows)]
+        {
+            // Use icacls to deny write access to the destination directory for the current user.
+            // *S-1-1-0 is the SID for "Everyone".
+            let _ = std::process::Command::new("icacls")
+                .arg(dest_path)
+                .arg("/deny")
+                .arg("*S-1-1-0:(OI)(CI)(W)")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
         }
 
         let args = Args {
