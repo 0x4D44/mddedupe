@@ -1,5 +1,4 @@
 use clap::{Parser, ValueEnum};
-use ctrlc;
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -19,13 +18,7 @@ use walkdir::WalkDir;
 enum FileId {
     #[cfg(unix)]
     Unix { dev: u64, ino: u64 },
-    #[cfg(windows)]
-    Windows {
-        volume: u64,
-        index_high: u64,
-        index_low: u64,
-    },
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     Path(String),
 }
 
@@ -148,21 +141,11 @@ fn file_id_from_metadata(path: &Path, metadata: &fs::Metadata) -> FileId {
         };
     }
 
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        use std::os::windows::fs::MetadataExt;
-        let _ = path;
-        return FileId::Windows {
-            volume: metadata.volume_serial_number(),
-            index_high: metadata.file_index_high(),
-            index_low: metadata.file_index_low(),
-        };
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
+        let _ = metadata;
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        return FileId::Path(canonical.to_string_lossy().into_owned());
+        FileId::Path(canonical.to_string_lossy().into_owned())
     }
 }
 
@@ -212,6 +195,7 @@ fn hash_file(path: &Path) -> io::Result<String> {
 /// - The duplicate count (excluding the first file in each duplicate group)
 /// - The total wasted space (sum of sizes for duplicate files)
 /// - The elapsed time
+#[allow(clippy::type_complexity)]
 fn find_duplicates_optimized_with_options(
     dir: &Path,
     emit_text: bool,
@@ -333,38 +317,42 @@ fn find_duplicates_optimized_with_options(
     let candidate_processed = Arc::new(AtomicUsize::new(0));
     let hash_sleep = hash_progress_sleep();
 
-    let progress_handle = if show_progress && candidate_total > 0 && hash_sleep.is_some() {
-        let candidate_processed_clone = candidate_processed.clone();
-        let progress_allowed_clone = progress_allowed.clone();
-        let sleep_duration = hash_sleep.unwrap();
-        Some(std::thread::spawn(move || {
-            loop {
-                if !progress_allowed_clone.load(Ordering::SeqCst) {
-                    break;
+    let progress_handle = if show_progress && candidate_total > 0 {
+        if let Some(sleep_duration) = hash_sleep {
+            let candidate_processed_clone = candidate_processed.clone();
+            let progress_allowed_clone = progress_allowed.clone();
+            Some(std::thread::spawn(move || {
+                loop {
+                    if !progress_allowed_clone.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if cancellation_requested() {
+                        break;
+                    }
+                    let processed = candidate_processed_clone.load(Ordering::Relaxed);
+                    let message = format!(
+                        "\rHashing files: processed {} of {} files",
+                        processed, candidate_total
+                    );
+                    if let Err(err) = handle_progress_result(
+                        write_progress_line(&message),
+                        &progress_allowed_clone,
+                    ) {
+                        eprintln!("Error writing hashing progress: {}", err);
+                        break;
+                    }
+                    if processed >= candidate_total {
+                        break;
+                    }
+                    std::thread::sleep(sleep_duration);
                 }
-                if cancellation_requested() {
-                    break;
+                if progress_allowed_clone.load(Ordering::SeqCst) {
+                    let _ = write_progress_line("\n");
                 }
-                let processed = candidate_processed_clone.load(Ordering::Relaxed);
-                let message = format!(
-                    "\rHashing files: processed {} of {} files",
-                    processed, candidate_total
-                );
-                if let Err(err) =
-                    handle_progress_result(write_progress_line(&message), &progress_allowed_clone)
-                {
-                    eprintln!("Error writing hashing progress: {}", err);
-                    break;
-                }
-                if processed >= candidate_total {
-                    break;
-                }
-                std::thread::sleep(sleep_duration);
-            }
-            if progress_allowed_clone.load(Ordering::SeqCst) {
-                let _ = write_progress_line("\n");
-            }
-        }))
+            }))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -541,8 +529,8 @@ struct JsonActionSummary {
 
 fn is_cross_device_error(err: &io::Error) -> bool {
     match err.raw_os_error() {
-        Some(code) if code == 18 => true, // POSIX EXDEV
-        Some(code) if code == 17 => true, // Windows ERROR_NOT_SAME_DEVICE
+        Some(18) => true, // POSIX EXDEV
+        Some(17) => true, // Windows ERROR_NOT_SAME_DEVICE
         _ => false,
     }
 }
@@ -563,12 +551,7 @@ fn write_progress_line(message: &str) -> io::Result<()> {
                     "simulated broken pipe",
                 ))
             }
-            "io_error" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "simulated progress failure",
-                ))
-            }
+            "io_error" => return Err(io::Error::other("simulated progress failure")),
             "cancel" => {
                 CANCEL_REQUESTED.store(true, Ordering::SeqCst);
                 return Err(io::Error::new(
@@ -651,6 +634,7 @@ fn relocate_file(src: &Path, dest: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(not(windows))]
 fn resolve_trash_destination() -> io::Result<PathBuf> {
     if let Ok(custom) = env::var("MDD_TRASH_DIR") {
         let dir = PathBuf::from(custom);
@@ -681,14 +665,6 @@ fn resolve_trash_destination() -> io::Result<PathBuf> {
         }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Trash action is not supported on Windows in this build",
-        ));
-    }
-
     Err(io::Error::new(
         io::ErrorKind::NotFound,
         "Unable to determine trash destination",
@@ -698,7 +674,7 @@ fn resolve_trash_destination() -> io::Result<PathBuf> {
 fn send_to_trash(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        trash::delete(path).map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+        trash::delete(path).map_err(|err| io::Error::other(err.to_string()))
     }
 
     #[cfg(not(windows))]
@@ -1080,7 +1056,7 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         };
 
         let json_output = serde_json::to_string_pretty(&json_summary)
-            .map_err(|err| AppError::Io(io::Error::new(io::ErrorKind::Other, err.to_string())))?;
+            .map_err(|err| AppError::Io(io::Error::other(err.to_string())))?;
         json_summary_output = Some(json_output.clone());
         println!("{}", json_output);
     }
