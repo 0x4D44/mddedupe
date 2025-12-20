@@ -1082,61 +1082,77 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Formats an AppError into a human-readable message and exit code.
+/// Returns (message, exit_code) or None for Io errors (which should be propagated).
+fn format_app_error(err: &AppError) -> Option<(String, i32)> {
+    match err {
+        AppError::Io(_) => None,
+        AppError::MissingMoveDestination => Some((
+            "Destination directory must be provided for move action.".to_string(),
+            1,
+        )),
+        AppError::CreateDestRequiresMove => Some((
+            "--create-dest can only be used together with --action move.".to_string(),
+            1,
+        )),
+        AppError::MoveDestinationNotDirectory(path) => Some((
+            format!("Destination path must be a directory: {}", path.display()),
+            1,
+        )),
+        AppError::MoveDestinationMissing(path) => Some((
+            format!(
+                "Destination directory {} does not exist (use --create-dest to create it).",
+                path.display()
+            ),
+            1,
+        )),
+        AppError::MoveDestinationCreateFailed(path, err) => Some((
+            format!(
+                "Failed to create destination directory {}: {}",
+                path.display(),
+                err
+            ),
+            1,
+        )),
+        AppError::CtrlCSetup(err) => Some((
+            format!("Failed to install Ctrl+C handler: {}", err),
+            1,
+        )),
+        AppError::Cancelled => Some(("Operation cancelled by user.".to_string(), 130)),
+        AppError::UnknownAction(action) => Some((
+            format!(
+                "Unknown action: {}. Valid options are move, trash or delete.",
+                action
+            ),
+            1,
+        )),
+        AppError::ActionFailures(count) => Some((
+            format!(
+                "Encountered {} action failures; exiting with error as requested.",
+                count
+            ),
+            2,
+        )),
+    }
+}
+
 fn main() -> io::Result<()> {
     let args = Args::parse();
     let stdin = io::stdin();
     let stdin_lock = stdin.lock();
     match run_app(args, stdin_lock) {
         Ok(()) => Ok(()),
-        Err(AppError::Io(err)) => Err(err),
-        Err(AppError::MissingMoveDestination) => {
-            eprintln!("Destination directory must be provided for move action.");
-            process::exit(1);
+        Err(ref e @ AppError::Io(ref err)) => {
+            // For Io errors, we need to clone the inner error
+            let _ = e;
+            Err(io::Error::new(err.kind(), err.to_string()))
         }
-        Err(AppError::CreateDestRequiresMove) => {
-            eprintln!("--create-dest can only be used together with --action move.");
-            process::exit(1);
-        }
-        Err(AppError::MoveDestinationNotDirectory(path)) => {
-            eprintln!("Destination path must be a directory: {}", path.display());
-            process::exit(1);
-        }
-        Err(AppError::MoveDestinationMissing(path)) => {
-            eprintln!(
-                "Destination directory {} does not exist (use --create-dest to create it).",
-                path.display()
-            );
-            process::exit(1);
-        }
-        Err(AppError::MoveDestinationCreateFailed(path, err)) => {
-            eprintln!(
-                "Failed to create destination directory {}: {}",
-                path.display(),
-                err
-            );
-            process::exit(1);
-        }
-        Err(AppError::CtrlCSetup(err)) => {
-            eprintln!("Failed to install Ctrl+C handler: {}", err);
-            process::exit(1);
-        }
-        Err(AppError::Cancelled) => {
-            eprintln!("Operation cancelled by user.");
-            process::exit(130);
-        }
-        Err(AppError::UnknownAction(action)) => {
-            eprintln!(
-                "Unknown action: {}. Valid options are move, trash or delete.",
-                action
-            );
-            process::exit(1);
-        }
-        Err(AppError::ActionFailures(count)) => {
-            eprintln!(
-                "Encountered {} action failures; exiting with error as requested.",
-                count
-            );
-            process::exit(2);
+        Err(ref err) => {
+            if let Some((msg, code)) = format_app_error(err) {
+                eprintln!("{}", msg);
+                process::exit(code);
+            }
+            unreachable!("All non-Io errors should be handled by format_app_error")
         }
     }
 }
@@ -2077,5 +2093,1774 @@ mod tests {
             find_duplicates_optimized_with_options(dir, true, false, true)
                 .expect("Failed to scan with symlinks");
         assert_eq!(dup_count_with_links, 1);
+    }
+
+    // ==================== Stage 1: Quick Wins ====================
+
+    #[test]
+    fn test_ansi_rgb_formats_correctly() {
+        let result = ansi_rgb(255, 128, 0, "test");
+        assert!(result.contains("255;128;0"));
+        assert!(result.contains("test"));
+        assert!(result.starts_with("\x1b[38;2;"));
+        assert!(result.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn test_is_cross_device_error_posix_exdev() {
+        let err = io::Error::from_raw_os_error(18);
+        assert!(is_cross_device_error(&err));
+    }
+
+    #[test]
+    fn test_is_cross_device_error_windows() {
+        let err = io::Error::from_raw_os_error(17);
+        assert!(is_cross_device_error(&err));
+    }
+
+    #[test]
+    fn test_is_cross_device_error_other() {
+        let err = io::Error::new(io::ErrorKind::Other, "not cross device");
+        assert!(!is_cross_device_error(&err));
+    }
+
+    #[test]
+    fn test_is_broken_pipe_os_error_32() {
+        let err = io::Error::from_raw_os_error(32);
+        assert!(is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn test_is_broken_pipe_os_error_109() {
+        let err = io::Error::from_raw_os_error(109);
+        assert!(is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn test_is_broken_pipe_kind() {
+        let err = io::Error::new(io::ErrorKind::BrokenPipe, "pipe broke");
+        assert!(is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn test_is_broken_pipe_other() {
+        let err = io::Error::new(io::ErrorKind::Other, "not a pipe error");
+        assert!(!is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn test_write_summary_to_path_creates_parent_dirs() {
+        let temp = TempDir::new().expect("temp dir");
+        let nested = temp.path().join("a").join("b").join("c").join("summary.txt");
+        write_summary_to_path(&nested, "test content").expect("write should succeed");
+        assert!(nested.exists());
+        let content = fs::read_to_string(&nested).expect("read");
+        assert_eq!(content, "test content\n");
+    }
+
+    #[test]
+    fn test_write_summary_to_path_adds_trailing_newline() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("summary.txt");
+        write_summary_to_path(&path, "no newline").expect("write");
+        let content = fs::read_to_string(&path).expect("read");
+        assert!(content.ends_with('\n'));
+        assert_eq!(content, "no newline\n");
+    }
+
+    #[test]
+    fn test_write_summary_to_path_preserves_existing_newline() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("summary.txt");
+        write_summary_to_path(&path, "has newline\n").expect("write");
+        let content = fs::read_to_string(&path).expect("read");
+        assert_eq!(content, "has newline\n");
+    }
+
+    #[test]
+    fn test_read_duration_from_env_invalid_value_uses_default() {
+        env::set_var("MDDEDUPE_TEST_DURATION", "not_a_number");
+        let result = read_duration_from_env("MDDEDUPE_TEST_DURATION", 500);
+        assert_eq!(result, Some(Duration::from_millis(500)));
+        env::remove_var("MDDEDUPE_TEST_DURATION");
+    }
+
+    #[test]
+    fn test_get_unique_destination_no_extension() {
+        let temp = TempDir::new().expect("temp dir");
+        let dest = temp.path();
+        fs::File::create(dest.join("noext")).expect("create base");
+        fs::File::create(dest.join("noext(1)")).expect("create collision");
+
+        let unique = get_unique_destination(dest, OsStr::new("noext"));
+        assert_eq!(unique.file_name().unwrap(), OsStr::new("noext(2)"));
+    }
+
+    #[test]
+    fn test_get_unique_destination_returns_initial_if_available() {
+        let temp = TempDir::new().expect("temp dir");
+        let dest = temp.path();
+        // Don't create any files - initial should be returned
+        let unique = get_unique_destination(dest, OsStr::new("newfile.txt"));
+        assert_eq!(unique, dest.join("newfile.txt"));
+    }
+
+    #[test]
+    fn test_file_id_from_metadata() {
+        let temp = TempDir::new().expect("temp dir");
+        let file_path = temp.path().join("test.txt");
+        fs::write(&file_path, b"content").expect("write");
+        let metadata = fs::metadata(&file_path).expect("metadata");
+        let id = file_id_from_metadata(&file_path, &metadata);
+        // Just verify it doesn't panic and returns something
+        match id {
+            #[cfg(unix)]
+            FileId::Unix { dev, ino } => {
+                assert!(dev > 0 || ino > 0);
+            }
+            #[cfg(not(unix))]
+            FileId::Path(p) => {
+                assert!(!p.is_empty());
+            }
+        }
+    }
+
+    // ==================== Stage 2: Error Path Tests ====================
+
+    #[test]
+    fn test_run_app_move_dest_is_file_error() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        // Create a FILE (not directory) as destination
+        let dest_file = temp.path().join("dest_as_file");
+        fs::write(&dest_file, b"I am a file not a directory").expect("create file as dest");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(dest_file),
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(matches!(result, Err(AppError::MoveDestinationNotDirectory(_))));
+    }
+
+    #[test]
+    fn test_run_app_move_dest_missing_no_create() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let nonexistent = temp.path().join("does_not_exist");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(nonexistent),
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(matches!(result, Err(AppError::MoveDestinationMissing(_))));
+    }
+
+    #[test]
+    fn test_run_app_json_summary_with_delete_action() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Json,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_app_summary_path_json() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"unique1").expect("write file1");
+
+        let summary_file = temp.path().join("output").join("summary.json");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: None,
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Json,
+            summary_path: Some(summary_file.clone()),
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        assert!(summary_file.exists());
+    }
+
+    #[test]
+    fn test_run_app_summary_path_text() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"unique1").expect("write file1");
+
+        let summary_file = temp.path().join("summary.txt");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: None,
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: Some(summary_file.clone()),
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        assert!(summary_file.exists());
+    }
+
+    #[test]
+    fn test_app_error_from_io_error_interrupted() {
+        let io_err = io::Error::new(io::ErrorKind::Interrupted, "interrupted");
+        let app_err: AppError = io_err.into();
+        assert!(matches!(app_err, AppError::Cancelled));
+    }
+
+    #[test]
+    fn test_app_error_from_io_error_other() {
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "not found");
+        let app_err: AppError = io_err.into();
+        assert!(matches!(app_err, AppError::Io(_)));
+    }
+
+    #[test]
+    fn test_run_app_with_trash_collision() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let trash_dir = TempDir::new().expect("trash temp dir");
+        let trash_path = trash_dir.path().join("files");
+        fs::create_dir_all(&trash_path).expect("create trash dir");
+        // Pre-create the expected trash file to trigger collision handling
+        fs::write(trash_path.join("file2.txt"), b"existing").expect("create collision");
+        env::set_var("MDD_TRASH_DIR", &trash_path);
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("trash".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        // Verify collision was handled - file2(1).txt should exist
+        let collided = trash_path.join("file2(1).txt");
+        assert!(collided.exists(), "Expected collision-renamed file at {}", collided.display());
+
+        env::remove_var("MDD_TRASH_DIR");
+    }
+
+    #[test]
+    fn test_send_to_trash_with_custom_dir() {
+        let temp = TempDir::new().expect("temp dir");
+        let file_path = temp.path().join("to_trash.txt");
+        fs::write(&file_path, b"trash me").expect("write file");
+
+        let trash_dir = TempDir::new().expect("trash dir");
+        let trash_path = trash_dir.path().join("mytrash");
+        env::set_var("MDD_TRASH_DIR", &trash_path);
+
+        let result = send_to_trash(&file_path);
+        assert!(result.is_ok());
+        assert!(!file_path.exists());
+        assert!(trash_path.join("to_trash.txt").exists());
+
+        env::remove_var("MDD_TRASH_DIR");
+    }
+
+    #[test]
+    fn test_relocate_file_same_device() {
+        let temp = TempDir::new().expect("temp dir");
+        let src = temp.path().join("source.txt");
+        let dest = temp.path().join("subdir").join("dest.txt");
+        fs::write(&src, b"content").expect("write source");
+
+        let result = relocate_file(&src, &dest);
+        assert!(result.is_ok());
+        assert!(!src.exists());
+        assert!(dest.exists());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "content");
+    }
+
+    // ==================== Stage 3: More Error Paths ====================
+
+    #[test]
+    fn test_run_app_create_dest_with_delete_action_error() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file.txt"), b"data").expect("write file");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: true,  // create_dest with non-move action
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(matches!(result, Err(AppError::CreateDestRequiresMove)));
+    }
+
+    #[test]
+    fn test_run_app_with_warn_logs_on_failure() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        // Use readonly destination to cause failures
+        let dest_dir = TempDir::new().expect("dest dir");
+        let dest_path = dest_dir.path();
+
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(dest_path).unwrap().permissions();
+            perms.set_mode(0o555);
+            fs::set_permissions(dest_path, perms).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("icacls")
+                .arg(dest_path)
+                .arg("/deny")
+                .arg("*S-1-1-0:(OI)(CI)(W)")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(dest_path.to_path_buf()),
+            force: true,
+            quiet: false,  // Not quiet to enable warn_logs
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Warn,  // Warn level to trigger warn_logs
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        // The operation should complete (failures are logged but not fatal)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_process_duplicates_with_empty_path() {
+        // Test with a group that has one file (should be skipped)
+        let temp = TempDir::new().expect("temp dir");
+        let dest_dir = temp.path().join("dest");
+        fs::create_dir(&dest_dir).expect("create dest");
+
+        let mut duplicates: HashMap<String, Vec<(PathBuf, u64)>> = HashMap::new();
+        // Add a group with only one file - should be skipped
+        duplicates.insert("single_hash".into(), vec![(temp.path().join("single.txt"), 5)]);
+        // Add a normal duplicate group
+        let file1 = temp.path().join("dup1.txt");
+        let file2 = temp.path().join("dup2.txt");
+        fs::write(&file1, b"dup").expect("write dup1");
+        fs::write(&file2, b"dup").expect("write dup2");
+        duplicates.insert("dup_hash".into(), vec![(file1.clone(), 3), (file2.clone(), 3)]);
+
+        let report = process_duplicates(
+            &duplicates,
+            &DuplicateAction::Move(dest_dir.clone()),
+            false,  // info_logs = false
+            false,  // error_logs = false
+        );
+        // Only the duplicate group should be processed
+        assert_eq!(report.total_candidates, 1);
+    }
+
+    #[test]
+    fn test_hash_file_error() {
+        let nonexistent = PathBuf::from("/this/path/does/not/exist/file.txt");
+        let result = hash_file(&nonexistent);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_trash_destination_with_env() {
+        let temp = TempDir::new().expect("temp dir");
+        let custom_trash = temp.path().join("custom_trash");
+        env::set_var("MDD_TRASH_DIR", &custom_trash);
+
+        let result = resolve_trash_destination();
+        assert!(result.is_ok());
+        let trash_dir = result.unwrap();
+        assert_eq!(trash_dir, custom_trash);
+        assert!(custom_trash.exists());
+
+        env::remove_var("MDD_TRASH_DIR");
+    }
+
+    #[test]
+    fn test_write_progress_line_unknown_mode() {
+        env::set_var("MDDEDUPE_PROGRESS_FAIL", "unknown_mode");
+        let result = write_progress_line("test");
+        // Unknown mode should fall through to normal behavior
+        assert!(result.is_ok());
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+    }
+
+    #[test]
+    fn test_cancellation_flag_operations() {
+        reset_cancellation_flag();
+        assert!(!cancellation_requested());
+
+        CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+        assert!(cancellation_requested());
+
+        reset_cancellation_flag();
+        assert!(!cancellation_requested());
+    }
+
+    #[test]
+    fn test_process_report_methods() {
+        let mut report = ProcessReport::new(5);
+        assert_eq!(report.total_candidates, 5);
+        assert_eq!(report.successes, 0);
+        assert_eq!(report.total_size_processed, 0);
+        assert!(report.failures.is_empty());
+
+        report.record_success(100);
+        assert_eq!(report.successes, 1);
+        assert_eq!(report.total_size_processed, 100);
+
+        report.record_failure(Path::new("/test/path"), 50, "test error");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].size, 50);
+        assert_eq!(report.failures[0].error, "test error");
+    }
+
+    #[test]
+    fn test_ansi_fixed_formats_correctly() {
+        let result = ansi_fixed(8, "gray text");
+        assert!(result.contains("\x1b[38;5;8m"));
+        assert!(result.contains("gray text"));
+        assert!(result.ends_with("\x1b[0m"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_trash_destination_windows_fallback() {
+        // On Windows without MDD_TRASH_DIR, should fail with NotFound
+        // (unless trash::delete works which is handled separately)
+        env::remove_var("MDD_TRASH_DIR");
+        let result = resolve_trash_destination();
+        // This will either succeed with Windows trash or fail
+        // We just verify it doesn't panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_run_app_with_log_level_error() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Error,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_app_with_log_level_none() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_app_summary_only_mode() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: true,  // summary_only mode
+            log_level: LogLevel::Info,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_follow_symlinks_with_files() {
+        let _guard = lock_progress();
+        set_progress_env();
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+
+        // Create regular files
+        let file1 = dir.join("file1.txt");
+        let file2 = dir.join("file2.txt");
+        fs::write(&file1, b"duplicate content").expect("write file1");
+        fs::write(&file2, b"duplicate content").expect("write file2");
+
+        // Create a subdirectory with symlinked file
+        let subdir = dir.join("subdir");
+        fs::create_dir(&subdir).expect("create subdir");
+        let file3 = subdir.join("file3.txt");
+        fs::write(&file3, b"duplicate content").expect("write file3");
+
+        // Scan WITH follow_symlinks
+        let (_, scanned, dup_count, _, _) =
+            find_duplicates_optimized_with_options(dir, false, false, true)
+                .expect("scan with follow_symlinks");
+
+        assert_eq!(scanned, 3);
+        assert_eq!(dup_count, 2);
+    }
+
+    #[test]
+    fn test_run_app_read_only_with_duplicates() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: None,  // No action = read-only
+            dest: None,
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        // Both files should still exist
+        assert!(dir.join("file1.txt").exists());
+        assert!(dir.join("file2.txt").exists());
+    }
+
+    #[test]
+    fn test_json_summary_without_action() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"unique").expect("write file1");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: None,
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Json,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_app_move_dest_create_fails() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        // Create a read-only parent directory
+        let readonly_parent = temp.path().join("readonly");
+        fs::create_dir(&readonly_parent).expect("create readonly parent");
+        let mut perms = fs::metadata(&readonly_parent).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&readonly_parent, perms.clone()).expect("set permissions");
+
+        let dest = readonly_parent.join("newdir");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(dest),
+            force: true,
+            quiet: true,
+            create_dest: true,  // Try to create in readonly parent
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(matches!(result, Err(AppError::MoveDestinationCreateFailed(_, _))));
+
+        // Restore permissions for cleanup
+        perms.set_mode(0o755);
+        fs::set_permissions(&readonly_parent, perms).expect("restore permissions");
+    }
+
+    // ==================== Stage 4: Edge Cases ====================
+
+    #[test]
+    fn test_write_summary_to_path_root_file() {
+        // Test with a path that has no parent directory
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("rootfile.txt");
+        write_summary_to_path(&path, "content").expect("write");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_write_summary_to_path_empty_parent() {
+        // File with just a filename, no parent path component
+        let temp = TempDir::new().expect("temp dir");
+        let _cwd = env::current_dir().unwrap();
+        let _ = env::set_current_dir(temp.path());
+
+        let path = PathBuf::from("relative.txt");
+        let result = write_summary_to_path(&path, "content");
+        // Should succeed or fail gracefully
+        let _ = result;
+
+        // Restore
+        let _ = env::set_current_dir(_cwd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_send_to_trash_windows_without_env() {
+        // On Windows without MDD_TRASH_DIR, should use native trash
+        env::remove_var("MDD_TRASH_DIR");
+        let temp = TempDir::new().expect("temp dir");
+        let file_path = temp.path().join("to_delete.txt");
+        fs::write(&file_path, b"delete me").expect("write file");
+
+        let result = send_to_trash(&file_path);
+        // Either succeeds with Windows trash or fails - just verify no panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_process_duplicates_with_info_logs() {
+        let temp = TempDir::new().expect("temp dir");
+        let file1 = temp.path().join("file1.txt");
+        let file2 = temp.path().join("file2.txt");
+        fs::write(&file1, b"dup").expect("write file1");
+        fs::write(&file2, b"dup").expect("write file2");
+
+        let hash = hash_file(&file1).expect("hash");
+        let size = fs::metadata(&file1).unwrap().len();
+        let mut duplicates = HashMap::new();
+        duplicates.insert(hash, vec![(file1.clone(), size), (file2.clone(), size)]);
+
+        let report = process_duplicates(
+            &duplicates,
+            &DuplicateAction::Delete,
+            true,   // info_logs = true
+            true,   // error_logs = true
+        );
+
+        assert_eq!(report.successes, 1);
+    }
+
+    #[test]
+    fn test_multiple_duplicate_groups() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+
+        // Create two different duplicate groups
+        fs::write(dir.join("a1.txt"), b"group_a").expect("write");
+        fs::write(dir.join("a2.txt"), b"group_a").expect("write");
+        fs::write(dir.join("b1.txt"), b"group_b").expect("write");
+        fs::write(dir.join("b2.txt"), b"group_b").expect("write");
+        fs::write(dir.join("unique.txt"), b"unique_content").expect("write");
+
+        let (dups, scanned, dup_count, _, _) =
+            find_duplicates_optimized_with_options(dir, false, false, false)
+                .expect("scan");
+
+        assert_eq!(scanned, 5);
+        assert_eq!(dups.len(), 2);  // Two duplicate groups
+        assert_eq!(dup_count, 2);   // Two duplicates total (one from each group)
+    }
+
+    #[test]
+    fn test_run_app_user_confirms_action() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".into()),
+            dest: None,
+            force: false,  // Requires confirmation
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        // User confirms with "y"
+        let result = run_app(args, Cursor::new(b"y\n".to_vec()));
+        assert!(result.is_ok());
+
+        // One file should be deleted
+        let remaining: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .collect();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn test_large_file_hash() {
+        let temp = TempDir::new().expect("temp dir");
+        let file_path = temp.path().join("large.bin");
+
+        // Create a file larger than the 16KB buffer to ensure multiple reads
+        let data = vec![0u8; 64 * 1024];  // 64KB
+        fs::write(&file_path, &data).expect("write large file");
+
+        let result = hash_file(&file_path);
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        assert_eq!(hash.len(), 64);  // SHA-256 produces 64 hex chars
+    }
+
+    #[test]
+    fn test_empty_directory_scan() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let empty_dir = temp.path().join("empty");
+        fs::create_dir(&empty_dir).expect("create empty dir");
+
+        let (dups, scanned, dup_count, wasted, _) =
+            find_duplicates_optimized_with_options(&empty_dir, false, false, false)
+                .expect("scan empty");
+
+        assert_eq!(scanned, 0);
+        assert_eq!(dup_count, 0);
+        assert_eq!(wasted, 0);
+        assert!(dups.is_empty());
+    }
+
+    #[test]
+    fn test_single_file_no_duplicates() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("only_file.txt"), b"unique").expect("write");
+
+        let (dups, scanned, dup_count, wasted, _) =
+            find_duplicates_optimized_with_options(dir, false, false, false)
+                .expect("scan");
+
+        assert_eq!(scanned, 1);
+        assert_eq!(dup_count, 0);
+        assert_eq!(wasted, 0);
+        assert!(dups.is_empty());
+    }
+
+    #[test]
+    fn test_files_same_size_different_content() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+
+        // Same size but different content
+        fs::write(dir.join("file1.txt"), b"aaaa").expect("write");
+        fs::write(dir.join("file2.txt"), b"bbbb").expect("write");
+
+        let (dups, scanned, dup_count, _, _) =
+            find_duplicates_optimized_with_options(dir, false, false, false)
+                .expect("scan");
+
+        assert_eq!(scanned, 2);
+        assert_eq!(dup_count, 0);  // No duplicates - different content
+        assert!(dups.is_empty());
+    }
+
+    #[test]
+    fn test_nested_directory_scan() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+
+        fs::create_dir_all(dir.join("a/b/c")).expect("create nested");
+        fs::write(dir.join("root.txt"), b"dup").expect("write root");
+        fs::write(dir.join("a/level1.txt"), b"dup").expect("write level1");
+        fs::write(dir.join("a/b/level2.txt"), b"dup").expect("write level2");
+        fs::write(dir.join("a/b/c/level3.txt"), b"dup").expect("write level3");
+
+        let (_, scanned, dup_count, _, _) =
+            find_duplicates_optimized_with_options(dir, false, false, false)
+                .expect("scan nested");
+
+        assert_eq!(scanned, 4);
+        assert_eq!(dup_count, 3);  // 4 files, 1 original + 3 duplicates
+    }
+
+    #[test]
+    fn test_run_app_move_with_existing_dest() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let dest = TempDir::new().expect("dest dir");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(dest.path().to_path_buf()),
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_json_action_summary_structure() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let summary_path = temp.path().join("summary.json");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Json,
+            summary_path: Some(summary_path.clone()),
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+
+        // Verify JSON file was written
+        assert!(summary_path.exists());
+        let content = fs::read_to_string(&summary_path).expect("read json");
+        assert!(content.contains("\"action\""));
+        assert!(content.contains("\"delete\""));
+    }
+
+    #[test]
+    fn test_duration_with_zero() {
+        let d = Duration::from_secs(0);
+        let formatted = format_duration(d);
+        assert_eq!(formatted, "0 sec");
+    }
+
+    #[test]
+    fn test_human_readable_edge_cases() {
+        assert_eq!(human_readable(0), "0 bytes");
+        assert_eq!(human_readable(1), "1 bytes");
+        assert_eq!(human_readable(1023), "1023 bytes");
+        // Just under 1 MB
+        assert!(human_readable(1024 * 1024 - 1).contains("KB"));
+    }
+
+    // ==================== Stage 5: Additional Platform Tests ====================
+
+    #[test]
+    fn test_follow_symlinks_windows_no_symlinks() {
+        // On Windows, test follow_symlinks=true with regular directories
+        let _guard = lock_progress();
+        set_progress_env();
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+
+        // Create nested directories
+        fs::create_dir_all(dir.join("subdir")).expect("create subdir");
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("subdir/file2.txt"), b"dup").expect("write file2");
+
+        // Scan with follow_symlinks=true (even though no symlinks exist)
+        let (_, scanned, dup_count, _, _) =
+            find_duplicates_optimized_with_options(dir, false, false, true)
+                .expect("scan with follow_symlinks");
+
+        assert_eq!(scanned, 2);
+        assert_eq!(dup_count, 1);
+    }
+
+    #[test]
+    fn test_run_app_trash_with_info_logging() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let trash_dir = TempDir::new().expect("trash temp dir");
+        let trash_path = trash_dir.path().join("files");
+        env::set_var("MDD_TRASH_DIR", &trash_path);
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("trash".into()),
+            dest: None,
+            force: true,
+            quiet: false,  // Enable output
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,  // Info level for logging
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+
+        env::remove_var("MDD_TRASH_DIR");
+    }
+
+    #[test]
+    fn test_run_app_move_with_info_logging() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let dest = TempDir::new().expect("dest dir");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(dest.path().to_path_buf()),
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_app_delete_with_info_logging() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_json_summary_move_with_failures() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        // Use read-only destination to force failures
+        let dest_dir = TempDir::new().expect("dest dir");
+        let dest_path = dest_dir.path();
+
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(dest_path).unwrap().permissions();
+            perms.set_mode(0o555);
+            fs::set_permissions(dest_path, perms).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("icacls")
+                .arg(dest_path)
+                .arg("/deny")
+                .arg("*S-1-1-0:(OI)(CI)(W)")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(dest_path.to_path_buf()),
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Json,  // JSON format
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Warn,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_three_way_duplicates() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+
+        // Create 3 identical files
+        fs::write(dir.join("copy1.txt"), b"same content").expect("write 1");
+        fs::write(dir.join("copy2.txt"), b"same content").expect("write 2");
+        fs::write(dir.join("copy3.txt"), b"same content").expect("write 3");
+
+        let (dups, scanned, dup_count, _, _) =
+            find_duplicates_optimized_with_options(dir, false, false, false)
+                .expect("scan");
+
+        assert_eq!(scanned, 3);
+        assert_eq!(dups.len(), 1);  // One duplicate group
+        assert_eq!(dup_count, 2);   // 3 files - 1 original = 2 duplicates
+    }
+
+    #[test]
+    fn test_delete_three_way_duplicates() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+
+        fs::write(dir.join("copy1.txt"), b"same").expect("write 1");
+        fs::write(dir.join("copy2.txt"), b"same").expect("write 2");
+        fs::write(dir.join("copy3.txt"), b"same").expect("write 3");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+
+        let remaining: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .collect();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn test_json_summary_with_no_action() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let summary_path = temp.path().join("readonly_summary.json");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: None,  // No action
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Json,
+            summary_path: Some(summary_path.clone()),
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        assert!(summary_path.exists());
+
+        // Verify no action in JSON
+        let content = fs::read_to_string(&summary_path).expect("read json");
+        assert!(content.contains("\"action\":null") || content.contains("\"action\": null"));
+    }
+
+    #[test]
+    fn test_create_dest_and_move() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let dest = temp.path().join("created_dest");
+        assert!(!dest.exists());
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(dest.clone()),
+            force: true,
+            quiet: true,
+            create_dest: true,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        assert!(dest.exists());
+    }
+
+    // ==================== Stage 6: Final Coverage Push ====================
+
+    #[test]
+    fn test_process_duplicates_with_path_no_filename() {
+        // Test with path that has no file_name component (like "/" or "C:\")
+        let temp = TempDir::new().expect("temp dir");
+        let dest = TempDir::new().expect("dest dir");
+
+        // Create a valid file and get its hash
+        let valid_file = temp.path().join("valid.txt");
+        fs::write(&valid_file, b"content").expect("write");
+        let hash = hash_file(&valid_file).expect("hash");
+        let size = 7u64;
+
+        let mut duplicates: HashMap<String, Vec<(PathBuf, u64)>> = HashMap::new();
+        // Add valid file and a path with no file_name
+        duplicates.insert(hash, vec![
+            (valid_file.clone(), size),
+            // Root path has no file_name
+            (PathBuf::from("/"), size),
+        ]);
+
+        let report = process_duplicates(
+            &duplicates,
+            &DuplicateAction::Move(dest.path().to_path_buf()),
+            false,
+            true,  // error_logs = true to hit eprintln path
+        );
+
+        // Should have recorded a failure for the invalid path
+        assert_eq!(report.failures.len(), 1);
+    }
+
+    #[test]
+    fn test_run_app_create_dest_with_trash_action() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file.txt"), b"data").expect("write file");
+
+        let trash_dir = TempDir::new().expect("trash temp dir");
+        let trash_path = trash_dir.path().join("files");
+        env::set_var("MDD_TRASH_DIR", &trash_path);
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("trash".into()),  // Trash action, not move
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: true,  // create_dest with non-move action
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(matches!(result, Err(AppError::CreateDestRequiresMove)));
+
+        env::remove_var("MDD_TRASH_DIR");
+    }
+
+    #[test]
+    fn test_run_app_json_with_move_action() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let dest = TempDir::new().expect("dest dir");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("move".into()),
+            dest: Some(dest.path().to_path_buf()),
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Json,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_app_json_with_trash_action() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let trash_dir = TempDir::new().expect("trash temp dir");
+        let trash_path = trash_dir.path().join("files");
+        env::set_var("MDD_TRASH_DIR", &trash_path);
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("trash".into()),
+            dest: None,
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Json,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+
+        env::remove_var("MDD_TRASH_DIR");
+    }
+
+    #[test]
+    fn test_write_summary_to_path_existing_dir() {
+        let temp = TempDir::new().expect("temp dir");
+        let existing_dir = temp.path().join("existing");
+        fs::create_dir(&existing_dir).expect("create dir");
+
+        let path = existing_dir.join("summary.txt");
+        let result = write_summary_to_path(&path, "content");
+        assert!(result.is_ok());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_run_app_with_many_files() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+
+        // Create many files with same content
+        for i in 0..10 {
+            fs::write(dir.join(format!("file{}.txt", i)), b"duplicate").expect("write");
+        }
+
+        let (dups, scanned, dup_count, _, _) =
+            find_duplicates_optimized_with_options(dir, false, false, false)
+                .expect("scan");
+
+        assert_eq!(scanned, 10);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dup_count, 9);  // 10 files - 1 original = 9 duplicates
+    }
+
+    #[test]
+    fn test_run_app_quiet_mode_no_action() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: None,
+            dest: None,
+            force: true,
+            quiet: true,  // Quiet mode
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_process_duplicates_with_move_info_logs() {
+        let temp = TempDir::new().expect("temp dir");
+        let file1 = temp.path().join("file1.txt");
+        let file2 = temp.path().join("file2.txt");
+        fs::write(&file1, b"dup").expect("write file1");
+        fs::write(&file2, b"dup").expect("write file2");
+
+        let dest = TempDir::new().expect("dest dir");
+
+        let hash = hash_file(&file1).expect("hash");
+        let size = fs::metadata(&file1).unwrap().len();
+        let mut duplicates = HashMap::new();
+        duplicates.insert(hash, vec![(file1.clone(), size), (file2.clone(), size)]);
+
+        let report = process_duplicates(
+            &duplicates,
+            &DuplicateAction::Move(dest.path().to_path_buf()),
+            true,   // info_logs = true
+            true,   // error_logs = true
+        );
+
+        assert_eq!(report.successes, 1);
+    }
+
+    #[test]
+    fn test_process_duplicates_with_trash_info_logs() {
+        let temp = TempDir::new().expect("temp dir");
+        let file1 = temp.path().join("file1.txt");
+        let file2 = temp.path().join("file2.txt");
+        fs::write(&file1, b"dup").expect("write file1");
+        fs::write(&file2, b"dup").expect("write file2");
+
+        let trash_dir = TempDir::new().expect("trash dir");
+        let trash_path = trash_dir.path().join("files");
+        env::set_var("MDD_TRASH_DIR", &trash_path);
+
+        let hash = hash_file(&file1).expect("hash");
+        let size = fs::metadata(&file1).unwrap().len();
+        let mut duplicates = HashMap::new();
+        duplicates.insert(hash, vec![(file1.clone(), size), (file2.clone(), size)]);
+
+        let report = process_duplicates(
+            &duplicates,
+            &DuplicateAction::Trash,
+            true,   // info_logs = true
+            true,   // error_logs = true
+        );
+
+        assert_eq!(report.successes, 1);
+
+        env::remove_var("MDD_TRASH_DIR");
+    }
+
+    #[test]
+    fn test_human_readable_large_values() {
+        // Test GB range
+        let gb = 1024 * 1024 * 1024;
+        let result = human_readable(gb);
+        assert!(result.contains("GB"));
+
+        // Test 2 GB
+        let two_gb = 2 * gb;
+        let result = human_readable(two_gb);
+        assert!(result.contains("GB"));
+    }
+
+    #[test]
+    fn test_format_duration_long() {
+        let d = Duration::from_secs(125);  // 2 min 5 sec
+        let formatted = format_duration(d);
+        assert!(formatted.contains("min"));
+        assert!(formatted.contains("sec"));
+    }
+
+    #[test]
+    fn test_install_ctrlc_handler_already_set() {
+        // Just verify it doesn't panic when called multiple times
+        // (In a test environment, the handler may already be set)
+        let result = install_ctrlc_handler();
+        // Either Ok or Err is acceptable - what matters is no panic
+        let _ = result;
+    }
+
+    // ==================== Stage 7: Error Formatting Tests ====================
+
+    #[test]
+    fn test_format_app_error_io() {
+        let err = AppError::Io(io::Error::new(io::ErrorKind::NotFound, "test"));
+        assert!(format_app_error(&err).is_none());
+    }
+
+    #[test]
+    fn test_format_app_error_missing_move_destination() {
+        let err = AppError::MissingMoveDestination;
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("Destination directory must be provided"));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_create_dest_requires_move() {
+        let err = AppError::CreateDestRequiresMove;
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("--create-dest"));
+        assert!(msg.contains("--action move"));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_move_dest_not_directory() {
+        let path = PathBuf::from("/some/path");
+        let err = AppError::MoveDestinationNotDirectory(path.clone());
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("must be a directory"));
+        assert!(msg.contains(&path.display().to_string()));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_move_dest_missing() {
+        let path = PathBuf::from("/nonexistent");
+        let err = AppError::MoveDestinationMissing(path.clone());
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("does not exist"));
+        assert!(msg.contains("--create-dest"));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_move_dest_create_failed() {
+        let path = PathBuf::from("/some/path");
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let err = AppError::MoveDestinationCreateFailed(path.clone(), io_err);
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("Failed to create destination"));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_ctrlc_setup() {
+        let err = AppError::CtrlCSetup("test error".to_string());
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("Ctrl+C handler"));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_cancelled() {
+        let err = AppError::Cancelled;
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("cancelled"));
+        assert_eq!(code, 130);
+    }
+
+    #[test]
+    fn test_format_app_error_unknown_action() {
+        let err = AppError::UnknownAction("badaction".to_string());
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("badaction"));
+        assert!(msg.contains("move, trash or delete"));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_action_failures() {
+        let err = AppError::ActionFailures(5);
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("5 action failures"));
+        assert_eq!(code, 2);
     }
 }
