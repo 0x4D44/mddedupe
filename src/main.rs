@@ -3496,12 +3496,10 @@ mod tests {
         let size = 7u64;
 
         let mut duplicates: HashMap<String, Vec<(PathBuf, u64)>> = HashMap::new();
-        // Add valid file and a path with no file_name
-        duplicates.insert(hash, vec![
-            (valid_file.clone(), size),
-            // Root path has no file_name
-            (PathBuf::from("/"), size),
-        ]);
+        // Add valid file and an invalid path that is guaranteed to sort after the valid file so it
+        // will be processed (the first sorted entry is kept).
+        let invalid_path = valid_file.join("..");
+        duplicates.insert(hash, vec![(valid_file.clone(), size), (invalid_path, size)]);
 
         let report = process_duplicates(
             &duplicates,
