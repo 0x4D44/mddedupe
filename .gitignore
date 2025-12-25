@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+
+# Editor/OS junk
+.DS_Store
+*.swp
+*.swo
+
+# Local scratch files
+/testfile
+/testfile2
+/tmpzek53un1
