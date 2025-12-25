@@ -1296,6 +1296,7 @@ mod tests {
 
     #[test]
     fn test_progress_env_zero_disables_progress() {
+        let _guard = lock_progress();
         env::set_var("MDDEDUPE_SCAN_PROGRESS_MS", "0");
         env::set_var("MDDEDUPE_HASH_PROGRESS_MS", "0");
         assert!(scan_progress_interval().is_none());
@@ -1306,6 +1307,7 @@ mod tests {
 
     #[test]
     fn test_progress_env_one_ms_respected() {
+        let _guard = lock_progress();
         env::set_var("MDDEDUPE_SCAN_PROGRESS_MS", "1");
         env::set_var("MDDEDUPE_HASH_PROGRESS_MS", "1");
         assert_eq!(
