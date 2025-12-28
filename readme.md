@@ -30,9 +30,11 @@ A fast, safe, and user-friendly command-line tool written in Rust for finding an
 
 ### Advanced Features
 - **Real-time progress indicators** with configurable update intervals
+  - Set `MDDEDUPE_*_PROGRESS_MS=0` to disable progress output entirely
 - **JSON output** for automation and scripting
 - **Multiple logging levels** (info, warn, error, none)
 - **Symlink handling** (optional, disabled by default for safety)
+  - Cycle guard prevents infinite loops when links point back into visited directories
 - **Broken pipe resilience** for seamless integration with Unix pipelines
 - **File collision handling** with automatic unique naming (file(1).txt, file(2).txt, ...)
 
@@ -133,7 +135,7 @@ mddedupe [OPTIONS] <DIRECTORY>
 - `--log-level <LEVEL>` - Logging verbosity: info, warn, error, none (default: info)
 
 **Scanning Behavior:**
-- `--follow-symlinks` - Follow symbolic links during scan (default: disabled for safety)
+- `--follow-symlinks` - Follow symbolic links during scan (default: disabled for safety). A cycle guard skips already-visited directories to prevent infinite recursion.
 
 **Help:**
 - `-h, --help` - Display help information
@@ -144,8 +146,8 @@ mddedupe [OPTIONS] <DIRECTORY>
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `MDD_TRASH_DIR` | Override trash destination (Unix/macOS) | Platform default |
-| `MDDEDUPE_SCAN_PROGRESS_MS` | Scan progress update interval (ms) | 1000 |
-| `MDDEDUPE_HASH_PROGRESS_MS` | Hash progress update interval (ms) | 500 |
+| `MDDEDUPE_SCAN_PROGRESS_MS` | Scan progress update interval (ms). Set `0` to disable progress output. | 1000 |
+| `MDDEDUPE_HASH_PROGRESS_MS` | Hash progress update interval (ms). Set `0` to disable progress output. | 500 |
 
 ### Exit Codes
 

@@ -2,6 +2,8 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use assert_fs::{prelude::*, NamedTempFile};
 use serde_json::Value;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 fn create_duplicate_fixture() -> assert_fs::TempDir {
     let temp = assert_fs::TempDir::new().expect("Failed to create temp dir");
     temp.child("file1.txt")
@@ -230,4 +232,82 @@ fn cli_log_level_warn_suppresses_info_logs() {
     let stdout = String::from_utf8(output).expect("stdout should be valid UTF-8");
     assert!(stdout.contains("Duplicate scan summary:"));
     assert!(!stdout.contains("Duplicate group"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_log_level_none_reports_failures() {
+    let temp = create_duplicate_fixture();
+    let dir = temp.path();
+
+    // Destination is present but unwritable to force move failure.
+    let dest = assert_fs::TempDir::new().expect("create dest");
+    let dest_path = dest.path();
+    let mut perms = fs::metadata(dest_path)
+        .expect("dest metadata")
+        .permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(dest_path, perms).expect("set dest perms");
+
+    let assert = cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "1")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "1")
+        .args([
+            dir.to_str().unwrap(),
+            "--action",
+            "move",
+            "--dest",
+            dest_path.to_str().unwrap(),
+            "--force",
+            "--log-level",
+            "none",
+            "--summary-silent",
+        ])
+        .assert()
+        .success();
+
+    let stderr =
+        String::from_utf8(assert.get_output().stderr.clone()).expect("stderr should be utf-8");
+    assert!(
+        stderr.contains("failures"),
+        "expected failure summary in stderr, got: {}",
+        stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_fail_on_error_sets_exit_status() {
+    let temp = create_duplicate_fixture();
+    let dir = temp.path();
+
+    let dest = assert_fs::TempDir::new().expect("create dest");
+    let dest_path = dest.path();
+    let mut perms = fs::metadata(dest_path)
+        .expect("dest metadata")
+        .permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(dest_path, perms).expect("set dest perms");
+
+    let assert = cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "1")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "1")
+        .args([
+            dir.to_str().unwrap(),
+            "--action",
+            "move",
+            "--dest",
+            dest_path.to_str().unwrap(),
+            "--force",
+            "--log-level",
+            "none",
+            "--summary-silent",
+            "--fail-on-error",
+        ])
+        .assert()
+        .failure();
+
+    let stderr =
+        String::from_utf8(assert.get_output().stderr.clone()).expect("stderr should be utf-8");
+    assert!(stderr.contains("failures"));
 }
