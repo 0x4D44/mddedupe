@@ -11,13 +11,12 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
-static CTRL_C_ONCE: Once = Once::new();
-static CTRL_C_ERROR: OnceLock<String> = OnceLock::new();
+static CTRL_C_STATUS: OnceLock<Mutex<CtrlCStatus>> = OnceLock::new();
 
 /// A tool to scan a directory tree and identify duplicate files.
 /// By default the tool runs in read‑only mode.
@@ -116,6 +115,19 @@ fn reset_cancellation_flag() {
     CANCEL_REQUESTED.store(false, Ordering::SeqCst);
 }
 
+struct CtrlCStatus {
+    installed: bool,
+    error: Option<String>,
+}
+
+fn ctrlc_status() -> &'static Mutex<CtrlCStatus> {
+    CTRL_C_STATUS.get_or_init(|| Mutex::new(CtrlCStatus {
+        installed: false,
+        error: None,
+    }))
+}
+
+
 const DEFAULT_SCAN_PROGRESS_MS: u64 = 1_000;
 const DEFAULT_HASH_PROGRESS_MS: u64 = 500;
 
@@ -129,11 +141,129 @@ fn read_duration_from_env(var: &str, default_ms: u64) -> Duration {
 }
 
 fn scan_progress_interval() -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(override_value) = test_support::scan_interval_override() {
+            return override_value;
+        }
+    }
     read_duration_from_env("MDDEDUPE_SCAN_PROGRESS_MS", DEFAULT_SCAN_PROGRESS_MS)
 }
 
 fn hash_progress_sleep() -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(override_value) = test_support::hash_interval_override() {
+            return override_value;
+        }
+    }
     read_duration_from_env("MDDEDUPE_HASH_PROGRESS_MS", DEFAULT_HASH_PROGRESS_MS)
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+
+    static SCAN_INTERVAL_OVERRIDE: OnceLock<Mutex<Option<Duration>>> = OnceLock::new();
+    static HASH_INTERVAL_OVERRIDE: OnceLock<Mutex<Option<Duration>>> = OnceLock::new();
+    static RENAME_RESULTS: OnceLock<Mutex<VecDeque<io::Result<()>>>> = OnceLock::new();
+    static COPY_RESULTS: OnceLock<Mutex<VecDeque<io::Result<u64>>>> = OnceLock::new();
+    static CTRL_C_RESULTS: OnceLock<Mutex<VecDeque<Result<(), AppError>>>> = OnceLock::new();
+    static POST_HASH_HOOK: OnceLock<Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>> = OnceLock::new();
+
+    fn duration_cell(lock: &OnceLock<Mutex<Option<Duration>>>) -> &Mutex<Option<Duration>> {
+        lock.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn scan_interval_override() -> Option<Duration> {
+        *duration_cell(&SCAN_INTERVAL_OVERRIDE)
+            .lock()
+            .expect("scan interval override poisoned")
+    }
+
+    pub fn set_scan_interval_override(value: Option<Duration>) {
+        *duration_cell(&SCAN_INTERVAL_OVERRIDE)
+            .lock()
+            .expect("scan interval override poisoned") = value;
+    }
+
+    pub fn hash_interval_override() -> Option<Duration> {
+        *duration_cell(&HASH_INTERVAL_OVERRIDE)
+            .lock()
+            .expect("hash interval override poisoned")
+    }
+
+    pub fn set_hash_interval_override(value: Option<Duration>) {
+        *duration_cell(&HASH_INTERVAL_OVERRIDE)
+            .lock()
+            .expect("hash interval override poisoned") = value;
+    }
+
+    fn queue_cell<T>(lock: &OnceLock<Mutex<VecDeque<T>>>) -> &Mutex<VecDeque<T>> {
+        lock.get_or_init(|| Mutex::new(VecDeque::new()))
+    }
+
+    pub fn enqueue_rename_result(result: io::Result<()>) {
+        queue_cell(&RENAME_RESULTS)
+            .lock()
+            .expect("rename override poisoned")
+            .push_back(result);
+    }
+
+    pub fn next_rename_result() -> Option<io::Result<()>> {
+        queue_cell(&RENAME_RESULTS)
+            .lock()
+            .expect("rename override poisoned")
+            .pop_front()
+    }
+
+    pub fn enqueue_copy_result(result: io::Result<u64>) {
+        queue_cell(&COPY_RESULTS)
+            .lock()
+            .expect("copy override poisoned")
+            .push_back(result);
+    }
+
+    pub fn next_copy_result() -> Option<io::Result<u64>> {
+        queue_cell(&COPY_RESULTS)
+            .lock()
+            .expect("copy override poisoned")
+            .pop_front()
+    }
+
+    pub fn enqueue_ctrlc_result(result: Result<(), AppError>) {
+        queue_cell(&CTRL_C_RESULTS)
+            .lock()
+            .expect("ctrlc override poisoned")
+            .push_back(result);
+    }
+
+    pub fn next_ctrlc_result() -> Option<Result<(), AppError>> {
+        queue_cell(&CTRL_C_RESULTS)
+            .lock()
+            .expect("ctrlc override poisoned")
+            .pop_front()
+    }
+
+    fn post_hash_cell() -> &'static Mutex<Option<Box<dyn FnOnce() + Send + 'static>>> {
+        POST_HASH_HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn set_post_hash_hook<F>(hook: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        *post_hash_cell().lock().expect("post-hash hook lock poisoned") = Some(Box::new(hook));
+    }
+
+    pub fn take_post_hash_hook() -> Option<Box<dyn FnOnce() + Send + 'static>> {
+        post_hash_cell()
+            .lock()
+            .expect("post-hash hook lock poisoned")
+            .take()
+    }
 }
 
 /// Computes the SHA‑256 hash of a file by reading it in chunks.
@@ -314,6 +444,11 @@ fn find_duplicates_optimized_with_options(
 
     if let Some(handle) = progress_handle {
         let _ = handle.join();
+    }
+
+    #[cfg(test)]
+    if let Some(hook) = test_support::take_post_hash_hook() {
+        hook();
     }
 
     if cancellation_requested() {
@@ -511,19 +646,44 @@ fn write_summary_to_path(path: &Path, contents: &str) -> io::Result<()> {
 }
 
 fn install_ctrlc_handler() -> Result<(), AppError> {
-    CTRL_C_ONCE.call_once(|| {
-        if let Err(err) = ctrlc::set_handler(|| {
-            CANCEL_REQUESTED.store(true, Ordering::SeqCst);
-        }) {
-            let _ = CTRL_C_ERROR.set(err.to_string());
-        }
-    });
+    let status = ctrlc_status();
+    let mut guard = status
+        .lock()
+        .expect("Ctrl+C status lock poisoned");
 
-    if let Some(err) = CTRL_C_ERROR.get() {
-        return Err(AppError::CtrlCSetup(err.clone()));
+    if guard.installed {
+        if let Some(err) = &guard.error {
+            return Err(AppError::CtrlCSetup(err.clone()));
+        }
+        return Ok(());
     }
 
-    Ok(())
+    #[cfg(test)]
+    if let Some(result) = test_support::next_ctrlc_result() {
+        if let Err(err) = result {
+            if let AppError::CtrlCSetup(msg) = &err {
+                guard.error = Some(msg.clone());
+            }
+            return Err(err);
+        }
+        guard.error = None;
+        return Ok(());
+    }
+
+    match ctrlc::set_handler(|| {
+        CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+    }) {
+        Ok(()) => {
+            guard.installed = true;
+             guard.error = None;
+            Ok(())
+        }
+        Err(err) => {
+            guard.installed = true;
+            guard.error = Some(err.to_string());
+            Err(AppError::CtrlCSetup(err.to_string()))
+        }
+    }
 }
 
 fn handle_progress_result(
@@ -543,13 +703,33 @@ fn handle_progress_result(
     }
 }
 
+fn rename_with_overrides(src: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        if let Some(result) = test_support::next_rename_result() {
+            return result;
+        }
+    }
+    fs::rename(src, dest)
+}
+
+fn copy_with_overrides(src: &Path, dest: &Path) -> io::Result<u64> {
+    #[cfg(test)]
+    {
+        if let Some(result) = test_support::next_copy_result() {
+            return result;
+        }
+    }
+    fs::copy(src, dest)
+}
+
 fn relocate_file(src: &Path, dest: &Path) -> io::Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    match fs::rename(src, dest) {
+    match rename_with_overrides(src, dest) {
         Ok(_) => Ok(()),
-        Err(err) if is_cross_device_error(&err) => match fs::copy(src, dest) {
+        Err(err) if is_cross_device_error(&err) => match copy_with_overrides(src, dest) {
             Ok(_) => {
                 let file = fs::File::open(dest)?;
                 file.sync_all()?;
@@ -641,6 +821,21 @@ enum AppError {
     UnknownAction(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct AppExit {
+    code: i32,
+    message: String,
+}
+
+impl AppExit {
+    fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
 impl From<io::Error> for AppError {
     fn from(err: io::Error) -> Self {
         if err.kind() == io::ErrorKind::Interrupted {
@@ -648,6 +843,41 @@ impl From<io::Error> for AppError {
         } else {
             AppError::Io(err)
         }
+    }
+}
+
+fn describe_app_error(err: AppError) -> AppExit {
+    match err {
+        AppError::MissingMoveDestination => AppExit::new(1, "Destination directory must be provided for move action."),
+        AppError::CreateDestRequiresMove => AppExit::new(1, "--create-dest can only be used together with --action move."),
+        AppError::MoveDestinationNotDirectory(path) => AppExit::new(
+            1,
+            format!("Destination path must be a directory: {}", path.display()),
+        ),
+        AppError::MoveDestinationMissing(path) => AppExit::new(
+            1,
+            format!(
+                "Destination directory {} does not exist (use --create-dest to create it).",
+                path.display()
+            ),
+        ),
+        AppError::MoveDestinationCreateFailed(path, err) => AppExit::new(
+            1,
+            format!(
+                "Failed to create destination directory {}: {}",
+                path.display(),
+                err
+            ),
+        ),
+        AppError::CtrlCSetup(err) => {
+            AppExit::new(1, format!("Failed to install Ctrl+C handler: {}", err))
+        }
+        AppError::Cancelled => AppExit::new(130, "Operation cancelled by user."),
+        AppError::UnknownAction(action) => AppExit::new(
+            1,
+            format!("Unknown action: {}. Valid options are move, trash or delete.", action),
+        ),
+        AppError::Io(err) => AppExit::new(1, err.to_string()),
     }
 }
 
@@ -1006,47 +1236,10 @@ fn main() -> io::Result<()> {
     match run_app(args, stdin_lock) {
         Ok(()) => Ok(()),
         Err(AppError::Io(err)) => Err(err),
-        Err(AppError::MissingMoveDestination) => {
-            eprintln!("Destination directory must be provided for move action.");
-            process::exit(1);
-        }
-        Err(AppError::CreateDestRequiresMove) => {
-            eprintln!("--create-dest can only be used together with --action move.");
-            process::exit(1);
-        }
-        Err(AppError::MoveDestinationNotDirectory(path)) => {
-            eprintln!("Destination path must be a directory: {}", path.display());
-            process::exit(1);
-        }
-        Err(AppError::MoveDestinationMissing(path)) => {
-            eprintln!(
-                "Destination directory {} does not exist (use --create-dest to create it).",
-                path.display()
-            );
-            process::exit(1);
-        }
-        Err(AppError::MoveDestinationCreateFailed(path, err)) => {
-            eprintln!(
-                "Failed to create destination directory {}: {}",
-                path.display(),
-                err
-            );
-            process::exit(1);
-        }
-        Err(AppError::CtrlCSetup(err)) => {
-            eprintln!("Failed to install Ctrl+C handler: {}", err);
-            process::exit(1);
-        }
-        Err(AppError::Cancelled) => {
-            eprintln!("Operation cancelled by user.");
-            process::exit(130);
-        }
-        Err(AppError::UnknownAction(action)) => {
-            eprintln!(
-                "Unknown action: {}. Valid options are move, trash or delete.",
-                action
-            );
-            process::exit(1);
+        Err(other) => {
+            let exit = describe_app_error(other);
+            eprintln!("{}", exit.message);
+            process::exit(exit.code);
         }
     }
 }
@@ -1054,6 +1247,7 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::test_support;
     use std::env;
     use std::ffi::OsStr;
     use std::fs;
@@ -1077,6 +1271,348 @@ mod tests {
     fn set_progress_env() {
         env::set_var("MDDEDUPE_SCAN_PROGRESS_MS", "0");
         env::set_var("MDDEDUPE_HASH_PROGRESS_MS", "0");
+    }
+
+    struct ProgressOverrideGuard {
+        prev_scan: Option<Duration>,
+        prev_hash: Option<Duration>,
+    }
+
+    impl ProgressOverrideGuard {
+        fn new(scan: Option<Duration>, hash: Option<Duration>) -> Self {
+            let prev_scan = test_support::scan_interval_override();
+            test_support::set_scan_interval_override(scan);
+            let prev_hash = test_support::hash_interval_override();
+            test_support::set_hash_interval_override(hash);
+            Self { prev_scan, prev_hash }
+        }
+
+        fn with_scan(scan: Option<Duration>) -> Self {
+            let current_hash = test_support::hash_interval_override();
+            Self::new(scan, current_hash)
+        }
+
+        fn with_hash(hash: Option<Duration>) -> Self {
+            let current_scan = test_support::scan_interval_override();
+            Self::new(current_scan, hash)
+        }
+    }
+
+    impl Drop for ProgressOverrideGuard {
+        fn drop(&mut self) {
+            test_support::set_scan_interval_override(self.prev_scan);
+            test_support::set_hash_interval_override(self.prev_hash);
+        }
+    }
+
+    struct CancelFlagGuard;
+
+    impl CancelFlagGuard {
+        fn force_cancel() -> Self {
+            CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for CancelFlagGuard {
+        fn drop(&mut self) {
+            reset_cancellation_flag();
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var(key).ok();
+            env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                env::set_var(self.key, value);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn test_install_ctrlc_handler_reports_error() {
+        let _lock = lock_progress();
+        test_support::enqueue_ctrlc_result(Err(AppError::CtrlCSetup("simulated failure".into())));
+        let err = install_ctrlc_handler().expect_err("Expected ctrlc handler failure");
+        match err {
+            AppError::CtrlCSetup(msg) => assert_eq!(msg, "simulated failure"),
+            other => panic!("Expected CtrlCSetup error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_scan_progress_interval_override_is_used() {
+        let _lock = lock_progress();
+        let _guard = ProgressOverrideGuard::with_scan(Some(Duration::from_millis(5)));
+        assert_eq!(scan_progress_interval(), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn test_hash_progress_sleep_override_is_used() {
+        let _lock = lock_progress();
+        let _guard = ProgressOverrideGuard::with_hash(Some(Duration::from_millis(7)));
+        assert_eq!(hash_progress_sleep(), Duration::from_millis(7));
+    }
+
+    #[test]
+    fn test_find_duplicates_progress_reporting_paths() {
+        let _lock = lock_progress();
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+        let _overrides = ProgressOverrideGuard::new(
+            Some(Duration::from_millis(0)),
+            Some(Duration::from_millis(0)),
+        );
+
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        let file1 = dir.join("file1.txt");
+        let file2 = dir.join("file2.txt");
+        fs::write(&file1, b"duplicate").expect("Failed to write file1");
+        fs::write(&file2, b"duplicate").expect("Failed to write file2");
+
+        let result = find_duplicates_optimized_with_options(dir, true, true, false)
+            .expect("Progress reporting should succeed");
+        assert_eq!(result.1, 2);
+        assert_eq!(result.2, 1);
+    }
+
+    #[test]
+    fn test_find_duplicates_returns_interrupted_when_cancelled_before_scan() {
+        let _lock = lock_progress();
+        let _cancel_guard = CancelFlagGuard::force_cancel();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let err = find_duplicates_optimized_with_options(temp_dir.path(), false, false, false)
+            .expect_err("Expected cancellation to surface");
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn test_find_duplicates_progress_prefix_without_carriage_return() {
+        let _lock = lock_progress();
+        let _overrides = ProgressOverrideGuard::new(
+            Some(Duration::from_millis(0)),
+            Some(Duration::from_millis(5)),
+        );
+        env::set_var("MDDEDUPE_PROGRESS_FAIL", "broken_pipe");
+
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
+
+        let result = find_duplicates_optimized_with_options(dir, true, true, false)
+            .expect("Broken pipe should be handled");
+        assert_eq!(result.2, 1);
+
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+    }
+
+    #[test]
+    fn test_hashing_progress_error_logs_and_continues() {
+        let _lock = lock_progress();
+        env::set_var("MDDEDUPE_PROGRESS_FAIL", "io_error");
+
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
+
+        let result = find_duplicates_optimized_with_options(dir, false, true, false)
+            .expect("IO errors in hashing progress should be logged and ignored");
+        assert_eq!(result.2, 1);
+
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+    }
+
+    #[test]
+    fn test_find_duplicates_cancellation_during_hashing() {
+        let _lock = lock_progress();
+        env::set_var("MDDEDUPE_PROGRESS_FAIL", "cancel");
+
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
+
+        let err = find_duplicates_optimized_with_options(dir, false, true, false)
+            .expect_err("Cancellation during hashing should surface");
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+        reset_cancellation_flag();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_duplicates_hash_error_is_logged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = lock_progress();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        let file1 = dir.join("file1.txt");
+        let file2 = dir.join("file2.txt");
+        fs::write(&file1, b"dup").expect("Failed to write file1");
+        fs::write(&file2, b"dup").expect("Failed to write file2");
+
+        let mut perms = fs::metadata(&file2)
+            .expect("Failed to read permissions")
+            .permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&file2, perms).expect("Failed to tighten perms");
+
+        let result = find_duplicates_optimized_with_options(dir, false, false, false)
+            .expect("Hash errors should be ignored");
+        assert_eq!(result.2, 0, "Failed hashes should drop duplicates");
+    }
+
+    #[test]
+    fn test_find_duplicates_reports_cancellation_after_processing() {
+        let _lock = lock_progress();
+        reset_cancellation_flag();
+        test_support::set_post_hash_hook(|| {
+            CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+        });
+
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
+
+        let err = find_duplicates_optimized_with_options(dir, false, false, false)
+            .expect_err("Cancellation hook should stop processing");
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        reset_cancellation_flag();
+    }
+
+    #[test]
+    fn test_write_summary_to_path_handles_nested_dirs_and_newline() {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let target = temp_dir.path().join("nested/summaries/summary.txt");
+        write_summary_to_path(&target, "hello coverage").expect("Failed to write summary");
+        let contents = fs::read_to_string(&target).expect("Failed to read summary");
+        assert_eq!(contents, "hello coverage\n");
+    }
+
+    #[test]
+    fn test_relocate_file_falls_back_to_copy_for_cross_device() {
+        let _lock = lock_progress();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let src = temp_dir.path().join("source.txt");
+        let dest = temp_dir.path().join("dest/destination.txt");
+        fs::write(&src, b"payload").expect("Failed to seed source file");
+        test_support::enqueue_rename_result(Err(io::Error::from_raw_os_error(18)));
+
+        relocate_file(&src, &dest).expect("Relocate should copy on cross-device error");
+        assert!(!src.exists(), "Source should be removed after relocate");
+        let copied = fs::read_to_string(&dest).expect("Failed to read destination");
+        assert_eq!(copied, "payload");
+    }
+
+    #[test]
+    fn test_relocate_file_cleans_up_when_copy_fails() {
+        let _lock = lock_progress();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let src = temp_dir.path().join("source.txt");
+        let dest = temp_dir.path().join("dest/destination.txt");
+        fs::write(&src, b"payload").expect("Failed to seed source file");
+        test_support::enqueue_rename_result(Err(io::Error::from_raw_os_error(18)));
+        test_support::enqueue_copy_result(Err(io::Error::new(io::ErrorKind::Other, "copy fail")));
+
+        let err = relocate_file(&src, &dest).expect_err("Copy failure should bubble up");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(src.exists(), "Source remains when copy fails");
+        assert!(!dest.exists(), "Destination should be cleaned up on failure");
+    }
+
+    #[test]
+    fn test_resolve_trash_destination_uses_custom_env() {
+        let _lock = lock_progress();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let custom = temp_dir.path().join("custom-trash");
+        let _guard = EnvVarGuard::set("MDD_TRASH_DIR", &custom);
+        let path = resolve_trash_destination().expect("Custom trash dir should be used");
+        assert_eq!(path, custom);
+        assert!(path.exists(), "Custom trash dir should be created");
+    }
+
+    #[test]
+    fn test_resolve_trash_destination_prefers_xdg_data_home() {
+        let _lock = lock_progress();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let base = temp_dir.path().join("xdg-base");
+        fs::create_dir_all(&base).expect("Failed to create base dir");
+        let _mdd_guard = EnvVarGuard::remove("MDD_TRASH_DIR");
+        let _xdg_guard = EnvVarGuard::set("XDG_DATA_HOME", &base);
+        let _home_guard = EnvVarGuard::set("HOME", temp_dir.path());
+        let path = resolve_trash_destination().expect("XDG path should be used");
+        let expected = base.join("Trash").join("files");
+        assert_eq!(path, expected);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_resolve_trash_destination_falls_back_to_home() {
+        let _lock = lock_progress();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let home = temp_dir.path().join("home");
+        fs::create_dir_all(&home).expect("Failed to create fake home");
+        let _mdd_guard = EnvVarGuard::remove("MDD_TRASH_DIR");
+        let _xdg_guard = EnvVarGuard::remove("XDG_DATA_HOME");
+        let _home_guard = EnvVarGuard::set("HOME", &home);
+        let path = resolve_trash_destination().expect("HOME fallback should be used");
+        let expected = home.join(".local/share/Trash/files");
+        assert_eq!(path, expected);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_resolve_trash_destination_errors_when_no_envs() {
+        let _lock = lock_progress();
+        let _mdd_guard = EnvVarGuard::remove("MDD_TRASH_DIR");
+        let _xdg_guard = EnvVarGuard::remove("XDG_DATA_HOME");
+        let _home_guard = EnvVarGuard::remove("HOME");
+        let err = resolve_trash_destination().expect_err("Expected not found error");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_send_to_trash_generates_unique_name_when_collision() {
+        let _lock = lock_progress();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let trash_dir = temp_dir.path().join("trash");
+        fs::create_dir_all(&trash_dir).expect("Failed to create trash dir");
+        let _guard = EnvVarGuard::set("MDD_TRASH_DIR", &trash_dir);
+        fs::write(trash_dir.join("duplicate.txt"), b"existing").expect("Failed to seed first file");
+        fs::write(trash_dir.join("duplicate(1).txt"), b"existing").expect("Failed to seed second file");
+
+        let source_dir = TempDir::new().expect("Failed to create source dir");
+        let source_file = source_dir.path().join("duplicate.txt");
+        fs::write(&source_file, b"payload").expect("Failed to write source file");
+
+        send_to_trash(&source_file).expect("Send to trash should succeed");
+        assert!(!source_file.exists());
+        assert!(trash_dir.join("duplicate(2).txt").exists());
     }
 
     #[test]
@@ -1113,6 +1649,8 @@ mod tests {
 
     #[test]
     fn test_process_duplicates_skips_invalid_file_names() {
+        let _lock = lock_progress();
+        reset_cancellation_flag();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let dest_dir = temp_dir.path().join("dest");
         fs::create_dir(&dest_dir).expect("Failed to create destination directory");
@@ -1569,6 +2107,162 @@ mod tests {
     }
 
     #[test]
+    fn test_run_app_read_only_summary_stdout() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: None,
+            dest: None,
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            summary_format: SummaryFormat::Text,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_app_json_summary_writes_file() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
+        let summary_path = temp_dir.path().join("summary.json");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".to_string()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: Some(summary_path.clone()),
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            summary_format: SummaryFormat::Json,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        let contents = fs::read_to_string(&summary_path).expect("Failed to read summary");
+        let json: serde_json::Value = serde_json::from_str(contents.trim()).expect("Valid JSON");
+        assert_eq!(json["summary_format"].as_str(), Some("json"));
+        assert_eq!(json["action"]["action"].as_str(), Some("delete"));
+    }
+
+    #[test]
+    fn test_run_app_logs_duplicates_when_info_level() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: None,
+            dest: None,
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            summary_format: SummaryFormat::Text,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_app_force_prompt_accepts_yes() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".to_string()),
+            dest: None,
+            force: false,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            summary_format: SummaryFormat::Text,
+        };
+
+        let result = run_app(args, Cursor::new(b"y\n".to_vec()));
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_app_reports_action_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir = temp_dir.path();
+        fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
+
+        let metadata = fs::metadata(dir).expect("Failed to read dir metadata");
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(dir, perms).expect("Failed to restrict dir permissions");
+
+        let args = Args {
+            directory: dir.to_path_buf(),
+            action: Some("delete".to_string()),
+            dest: None,
+            force: true,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::Warn,
+            summary_format: SummaryFormat::Text,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+
+        let restore = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(dir, restore).expect("Failed to restore permissions");
+    }
+
+    #[test]
     fn test_hash_file() {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let file_path = temp_dir.path().join("test.txt");
@@ -1587,6 +2281,9 @@ mod tests {
 
     #[test]
     fn test_find_duplicates_optimized() {
+        let _guard = lock_progress();
+        set_progress_env();
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let dir_path = temp_dir.path();
 
@@ -1638,6 +2335,8 @@ mod tests {
 
     #[test]
     fn test_process_duplicates_delete() {
+        let _lock = lock_progress();
+        reset_cancellation_flag();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let dir_path = temp_dir.path();
 
@@ -1679,6 +2378,8 @@ mod tests {
 
     #[test]
     fn test_process_duplicates_move() {
+        let _lock = lock_progress();
+        reset_cancellation_flag();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let dir_path = temp_dir.path();
         let move_dest = TempDir::new().expect("Failed to create destination directory");
@@ -1732,6 +2433,8 @@ mod tests {
 
     #[test]
     fn test_process_duplicates_trash() {
+        let _lock = lock_progress();
+        reset_cancellation_flag();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let dir_path = temp_dir.path();
 
@@ -1788,6 +2491,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_process_duplicates_reports_permission_errors() {
+        let _lock = lock_progress();
+        reset_cancellation_flag();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let dir_path = temp_dir.path();
 
@@ -1829,6 +2534,52 @@ mod tests {
         // Restore permissions for TempDir cleanup.
         let restore_perms = fs::Permissions::from_mode(0o755);
         fs::set_permissions(dest_path, restore_perms).expect("Failed to restore permissions");
+    }
+
+    #[test]
+    fn test_process_duplicates_respects_cancellation_flag() {
+        let _lock = lock_progress();
+        let _cancel_guard = CancelFlagGuard::force_cancel();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let dir_path = temp_dir.path();
+        fs::write(dir_path.join("file1.txt"), b"dup").expect("Failed to write file1");
+        fs::write(dir_path.join("file2.txt"), b"dup").expect("Failed to write file2");
+
+        let hash = hash_file(&dir_path.join("file1.txt")).expect("Failed to hash file1");
+        let mut duplicates = HashMap::new();
+        duplicates.insert(
+            hash,
+            vec![
+                (dir_path.join("file1.txt"), 3),
+                (dir_path.join("file2.txt"), 3),
+            ],
+        );
+
+        let report = process_duplicates(&duplicates, &DuplicateAction::Delete, true, true);
+        assert_eq!(report.successes, 0);
+    }
+
+    #[test]
+    fn test_app_error_from_non_interrupted_is_wrapped() {
+        let err = io::Error::new(io::ErrorKind::Other, "boom");
+        match AppError::from(err) {
+            AppError::Io(inner) => assert_eq!(inner.kind(), io::ErrorKind::Other),
+            other => panic!("expected AppError::Io, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_describe_app_error_unknown_action() {
+        let exit = describe_app_error(AppError::UnknownAction("zip".into()));
+        assert_eq!(exit.code, 1);
+        assert!(exit.message.contains("zip"));
+    }
+
+    #[test]
+    fn test_describe_app_error_cancelled_code() {
+        let exit = describe_app_error(AppError::Cancelled);
+        assert_eq!(exit.code, 130);
+        assert!(exit.message.contains("cancelled"));
     }
 
     #[cfg(unix)]
