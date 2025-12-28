@@ -37,6 +37,18 @@ cargo test test_hash_file
 cargo test -- --nocapture
 ```
 
+### Linting & Formatting
+```bash
+# Check for common issues
+cargo clippy
+
+# Format code
+cargo fmt
+
+# Check formatting without modifying
+cargo fmt --check
+```
+
 ### Running
 ```bash
 # Run in development mode

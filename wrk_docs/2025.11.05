@@ -1,0 +1,30 @@
+# Code Review Plan – 2025-11-05
+
+## Code Inventory
+- `src/main.rs`: command-line interface, duplicate detection logic, progress reporting, duplicate action execution, and tests.
+- `Cargo.toml`: crate metadata and dependency versions (`ansi_term`, `clap`, `rayon`, `sha2`, `walkdir`, `tempfile`).
+
+## Review Objectives
+- Validate correctness and reliability of duplicate detection pipeline and hash-based grouping.
+- Assess safety of file actions (move/trash/delete) and user confirmations.
+- Evaluate concurrency, progress reporting, and shared-state management.
+- Inspect error handling, logging, and user messaging for clarity and resilience.
+- Examine performance characteristics and scalability for large directory trees.
+- Review tests for coverage and accuracy; identify missing edge cases.
+- Review dependency selections and configuration for security/maintenance risks.
+
+## Step-by-Step Plan
+1. **CLI & Argument Handling**: Inspect `Args` struct, validation of `action`/`dest`, default behaviors, and prompts.
+2. **Filesystem Walk & Grouping**: Review `find_duplicates_optimized` stage 1 (WalkDir usage, error handling, progress output, size-grouping limits).
+3. **Hashing & Concurrency**: Examine stage 2 parallel hashing, atomic counters, progress thread, error handling, and determinism.
+4. **Duplicate Accounting**: Verify duplicate counting, wasted-space calculation, and group aggregation logic.
+5. **Action Execution**: Audit `process_duplicates` including move/trash/delete branches, path handling, progress messaging, and force confirmation flow.
+6. **Utility Functions**: Check helpers (`human_readable`, `format_duration`, `get_unique_destination`) for correctness and edge cases.
+7. **Output & UX**: Review use of colors, quiet mode behavior, and summary formatting for usability.
+8. **Testing & Coverage**: Analyze `tests` module for thoroughness; identify missing scenarios (e.g., errors, move/delete behaviors, large files).
+9. **Dependencies & Build Config**: Evaluate crate versions for known maintenance/security issues and compatibility.
+10. **Risk Synthesis**: Summarize critical findings, categorize severity, and recommend mitigation steps.
+
+## Deliverables
+- Comprehensive written report of findings saved under `wrk_docs` as `2025.11.05 - CR - mddedupe.md`.
+- Summary of recommended next steps for maintainers.

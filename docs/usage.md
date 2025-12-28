@@ -38,13 +38,13 @@ When performing destructive actions without `--force`, the tool pauses for confi
 
 ## Handling Symlinks
 
-By default the scanner ignores symbolic links. Pass `--follow-symlinks` to hash the linked targets too:
+By default the scanner ignores symbolic links. Pass `--follow-symlinks` to hash the linked targets too. A cycle guard is in place to prevent infinite loops when links point back into previously visited directories:
 
 ```bash
 mddedupe --follow-symlinks /data/archive
 ```
 
-Be aware that following links can cross filesystem boundaries and may re-traverse already-visited content.
+Be aware that following links can cross filesystem boundaries; cycles are detected and skipped, but deep trees can still expand traversal scope.
 
 ## Progress Output & Piping
 
@@ -83,13 +83,17 @@ mddedupe --summary-only /data/archive
 # Reduce logging without hiding the summary
 mddedupe --log-level warn /data/archive
 
-# Turn off all duplicate/action logs (summary still shown unless --summary-silent)
+# Turn off all duplicate/action logs (summary still shown unless --summary-silent).
+# Per-file action failures still emit a one-line summary to stderr so issues are not silent; add --fail-on-error to make failures non-zero exit.
 mddedupe --log-level none --summary-path reports/latest.txt /data/archive
+
+# Treat per-file failures as fatal (exit code 2)
+mddedupe --action move --dest /quarantine --force --fail-on-error /data/archive
 ```
 
 ## Error Reporting
 
-During move/delete/trash actions the tool aggregates per-file outcomes. On completion it prints a summary of successes plus any failures (path, size, error). This allows the run to continue even if individual files are locked or permission-restricted.
+During move/delete/trash actions the tool aggregates per-file outcomes. On completion it prints a summary of successes plus any failures (path, size, error). Even with `--log-level none`, a concise failure line is emitted to stderr so issues are not silent. This allows the run to continue even if individual files are locked or permission-restricted.
 
 ## Exit Codes
 
