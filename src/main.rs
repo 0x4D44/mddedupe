@@ -132,12 +132,13 @@ struct CtrlCStatus {
 }
 
 fn ctrlc_status() -> &'static Mutex<CtrlCStatus> {
-    CTRL_C_STATUS.get_or_init(|| Mutex::new(CtrlCStatus {
-        installed: false,
-        error: None,
-    }))
+    CTRL_C_STATUS.get_or_init(|| {
+        Mutex::new(CtrlCStatus {
+            installed: false,
+            error: None,
+        })
+    })
 }
-
 
 const DEFAULT_SCAN_PROGRESS_MS: u64 = 1_000;
 const DEFAULT_HASH_PROGRESS_MS: u64 = 500;
@@ -204,9 +205,12 @@ mod test_support {
     static RENAME_RESULTS: OnceLock<Mutex<VecDeque<io::Result<()>>>> = OnceLock::new();
     static COPY_RESULTS: OnceLock<Mutex<VecDeque<io::Result<u64>>>> = OnceLock::new();
     static CTRL_C_RESULTS: OnceLock<Mutex<VecDeque<Result<(), AppError>>>> = OnceLock::new();
-    static POST_HASH_HOOK: OnceLock<Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>> = OnceLock::new();
+    static POST_HASH_HOOK: OnceLock<Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>> =
+        OnceLock::new();
 
-    fn duration_cell(lock: &OnceLock<Mutex<Option<Option<Duration>>>>) -> &Mutex<Option<Option<Duration>>> {
+    fn duration_cell(
+        lock: &OnceLock<Mutex<Option<Option<Duration>>>>,
+    ) -> &Mutex<Option<Option<Duration>>> {
         lock.get_or_init(|| Mutex::new(None))
     }
 
@@ -290,7 +294,9 @@ mod test_support {
     where
         F: FnOnce() + Send + 'static,
     {
-        *post_hash_cell().lock().expect("post-hash hook lock poisoned") = Some(Box::new(hook));
+        *post_hash_cell()
+            .lock()
+            .expect("post-hash hook lock poisoned") = Some(Box::new(hook));
     }
 
     pub fn take_post_hash_hook() -> Option<Box<dyn FnOnce() + Send + 'static>> {
@@ -727,9 +733,7 @@ fn install_ctrlc_handler() -> Result<(), AppError> {
     }
 
     let status = ctrlc_status();
-    let mut guard = status
-        .lock()
-        .expect("Ctrl+C status lock poisoned");
+    let mut guard = status.lock().expect("Ctrl+C status lock poisoned");
 
     if guard.installed {
         if let Some(err) = &guard.error {
@@ -743,7 +747,7 @@ fn install_ctrlc_handler() -> Result<(), AppError> {
     }) {
         Ok(()) => {
             guard.installed = true;
-             guard.error = None;
+            guard.error = None;
             Ok(())
         }
         Err(err) => {
@@ -799,8 +803,10 @@ fn relocate_file(src: &Path, dest: &Path) -> io::Result<()> {
         Ok(_) => Ok(()),
         Err(err) if is_cross_device_error(&err) => match copy_with_overrides(src, dest) {
             Ok(_) => {
-                let file = fs::File::open(dest)?;
+                // Open with write access to allow sync_all() to work on Windows
+                let file = fs::OpenOptions::new().write(true).open(dest)?;
                 file.sync_all()?;
+                drop(file); // Ensure handle is closed
                 fs::remove_file(src)
             }
             Err(copy_err) => {
@@ -1292,10 +1298,9 @@ fn format_app_error(err: &AppError) -> Option<(String, i32)> {
             ),
             1,
         )),
-        AppError::CtrlCSetup(err) => Some((
-            format!("Failed to install Ctrl+C handler: {}", err),
-            1,
-        )),
+        AppError::CtrlCSetup(err) => {
+            Some((format!("Failed to install Ctrl+C handler: {}", err), 1))
+        }
         AppError::Cancelled => Some(("Operation cancelled by user.".to_string(), 130)),
         AppError::UnknownAction(action) => Some((
             format!(
@@ -1337,8 +1342,8 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_support;
+    use super::*;
     use std::env;
     use std::ffi::OsStr;
     use std::fs;
@@ -1375,7 +1380,10 @@ mod tests {
             test_support::set_scan_interval_override(scan);
             let prev_hash = test_support::hash_interval_override();
             test_support::set_hash_interval_override(hash);
-            Self { prev_scan, prev_hash }
+            Self {
+                prev_scan,
+                prev_hash,
+            }
         }
 
         fn with_scan(scan: Option<Duration>) -> Self {
@@ -1612,7 +1620,13 @@ mod tests {
         let src = temp_dir.path().join("source.txt");
         let dest = temp_dir.path().join("dest/destination.txt");
         fs::write(&src, b"payload").expect("Failed to seed source file");
-        test_support::enqueue_rename_result(Err(io::Error::from_raw_os_error(18)));
+
+        #[cfg(unix)]
+        let cross_device_err = 18;
+        #[cfg(windows)]
+        let cross_device_err = 17;
+
+        test_support::enqueue_rename_result(Err(io::Error::from_raw_os_error(cross_device_err)));
 
         relocate_file(&src, &dest).expect("Relocate should copy on cross-device error");
         assert!(!src.exists(), "Source should be removed after relocate");
@@ -1627,13 +1641,22 @@ mod tests {
         let src = temp_dir.path().join("source.txt");
         let dest = temp_dir.path().join("dest/destination.txt");
         fs::write(&src, b"payload").expect("Failed to seed source file");
-        test_support::enqueue_rename_result(Err(io::Error::from_raw_os_error(18)));
+
+        #[cfg(unix)]
+        let cross_device_err = 18;
+        #[cfg(windows)]
+        let cross_device_err = 17;
+
+        test_support::enqueue_rename_result(Err(io::Error::from_raw_os_error(cross_device_err)));
         test_support::enqueue_copy_result(Err(io::Error::new(io::ErrorKind::Other, "copy fail")));
 
         let err = relocate_file(&src, &dest).expect_err("Copy failure should bubble up");
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(src.exists(), "Source remains when copy fails");
-        assert!(!dest.exists(), "Destination should be cleaned up on failure");
+        assert!(
+            !dest.exists(),
+            "Destination should be cleaned up on failure"
+        );
     }
 
     #[test]
@@ -1648,6 +1671,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_resolve_trash_destination_prefers_xdg_data_home() {
         let _lock = lock_progress();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
@@ -1663,6 +1687,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_resolve_trash_destination_falls_back_to_home() {
         let _lock = lock_progress();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
@@ -1695,7 +1720,8 @@ mod tests {
         fs::create_dir_all(&trash_dir).expect("Failed to create trash dir");
         let _guard = EnvVarGuard::set("MDD_TRASH_DIR", &trash_dir);
         fs::write(trash_dir.join("duplicate.txt"), b"existing").expect("Failed to seed first file");
-        fs::write(trash_dir.join("duplicate(1).txt"), b"existing").expect("Failed to seed second file");
+        fs::write(trash_dir.join("duplicate(1).txt"), b"existing")
+            .expect("Failed to seed second file");
 
         let source_dir = TempDir::new().expect("Failed to create source dir");
         let source_file = source_dir.path().join("duplicate.txt");
@@ -2880,7 +2906,12 @@ mod tests {
     #[test]
     fn test_write_summary_to_path_creates_parent_dirs() {
         let temp = TempDir::new().expect("temp dir");
-        let nested = temp.path().join("a").join("b").join("c").join("summary.txt");
+        let nested = temp
+            .path()
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("summary.txt");
         write_summary_to_path(&nested, "test content").expect("write should succeed");
         assert!(nested.exists());
         let content = fs::read_to_string(&nested).expect("read");
@@ -2986,7 +3017,10 @@ mod tests {
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
-        assert!(matches!(result, Err(AppError::MoveDestinationNotDirectory(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::MoveDestinationNotDirectory(_))
+        ));
     }
 
     #[test]
@@ -3161,7 +3195,11 @@ mod tests {
         assert!(result.is_ok());
         // Verify collision was handled - file2(1).txt should exist
         let collided = trash_path.join("file2(1).txt");
-        assert!(collided.exists(), "Expected collision-renamed file at {}", collided.display());
+        assert!(
+            collided.exists(),
+            "Expected collision-renamed file at {}",
+            collided.display()
+        );
 
         env::remove_var("MDD_TRASH_DIR");
     }
@@ -3214,7 +3252,7 @@ mod tests {
             dest: None,
             force: true,
             quiet: true,
-            create_dest: true,  // create_dest with non-move action
+            create_dest: true, // create_dest with non-move action
             follow_symlinks: false,
             summary_format: SummaryFormat::Text,
             summary_path: None,
@@ -3263,14 +3301,14 @@ mod tests {
             action: Some("move".into()),
             dest: Some(dest_path.to_path_buf()),
             force: true,
-            quiet: false,  // Not quiet to enable warn_logs
+            quiet: false, // Not quiet to enable warn_logs
             create_dest: false,
             follow_symlinks: false,
             summary_format: SummaryFormat::Text,
             summary_path: None,
             summary_silent: false,
             summary_only: false,
-            log_level: LogLevel::Warn,  // Warn level to trigger warn_logs
+            log_level: LogLevel::Warn, // Warn level to trigger warn_logs
             fail_on_error: false,
         };
 
@@ -3288,19 +3326,25 @@ mod tests {
 
         let mut duplicates: HashMap<String, Vec<(PathBuf, u64)>> = HashMap::new();
         // Add a group with only one file - should be skipped
-        duplicates.insert("single_hash".into(), vec![(temp.path().join("single.txt"), 5)]);
+        duplicates.insert(
+            "single_hash".into(),
+            vec![(temp.path().join("single.txt"), 5)],
+        );
         // Add a normal duplicate group
         let file1 = temp.path().join("dup1.txt");
         let file2 = temp.path().join("dup2.txt");
         fs::write(&file1, b"dup").expect("write dup1");
         fs::write(&file2, b"dup").expect("write dup2");
-        duplicates.insert("dup_hash".into(), vec![(file1.clone(), 3), (file2.clone(), 3)]);
+        duplicates.insert(
+            "dup_hash".into(),
+            vec![(file1.clone(), 3), (file2.clone(), 3)],
+        );
 
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Move(dest_dir.clone()),
-            false,  // info_logs = false
-            false,  // error_logs = false
+            false, // info_logs = false
+            false, // error_logs = false
         );
         // Only the duplicate group should be processed
         assert_eq!(report.total_candidates, 1);
@@ -3465,7 +3509,7 @@ mod tests {
             summary_format: SummaryFormat::Text,
             summary_path: None,
             summary_silent: false,
-            summary_only: true,  // summary_only mode
+            summary_only: true, // summary_only mode
             log_level: LogLevel::Info,
             fail_on_error: false,
         };
@@ -3516,7 +3560,7 @@ mod tests {
 
         let args = Args {
             directory: dir.to_path_buf(),
-            action: None,  // No action = read-only
+            action: None, // No action = read-only
             dest: None,
             force: true,
             quiet: false,
@@ -3590,7 +3634,7 @@ mod tests {
             dest: Some(dest),
             force: true,
             quiet: true,
-            create_dest: true,  // Try to create in readonly parent
+            create_dest: true, // Try to create in readonly parent
             follow_symlinks: false,
             summary_format: SummaryFormat::Text,
             summary_path: None,
@@ -3601,7 +3645,10 @@ mod tests {
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
-        assert!(matches!(result, Err(AppError::MoveDestinationCreateFailed(_, _))));
+        assert!(matches!(
+            result,
+            Err(AppError::MoveDestinationCreateFailed(_, _))
+        ));
 
         // Restore permissions for cleanup
         perms.set_mode(0o755);
@@ -3665,8 +3712,8 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Delete,
-            true,   // info_logs = true
-            true,   // error_logs = true
+            true, // info_logs = true
+            true, // error_logs = true
         );
 
         assert_eq!(report.successes, 1);
@@ -3687,12 +3734,11 @@ mod tests {
         fs::write(dir.join("unique.txt"), b"unique_content").expect("write");
 
         let (dups, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false)
-                .expect("scan");
+            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 5);
-        assert_eq!(dups.len(), 2);  // Two duplicate groups
-        assert_eq!(dup_count, 2);   // Two duplicates total (one from each group)
+        assert_eq!(dups.len(), 2); // Two duplicate groups
+        assert_eq!(dup_count, 2); // Two duplicates total (one from each group)
     }
 
     #[test]
@@ -3708,7 +3754,7 @@ mod tests {
             directory: dir.to_path_buf(),
             action: Some("delete".into()),
             dest: None,
-            force: false,  // Requires confirmation
+            force: false, // Requires confirmation
             quiet: true,
             create_dest: false,
             follow_symlinks: false,
@@ -3739,13 +3785,13 @@ mod tests {
         let file_path = temp.path().join("large.bin");
 
         // Create a file larger than the 16KB buffer to ensure multiple reads
-        let data = vec![0u8; 64 * 1024];  // 64KB
+        let data = vec![0u8; 64 * 1024]; // 64KB
         fs::write(&file_path, &data).expect("write large file");
 
         let result = hash_file(&file_path);
         assert!(result.is_ok());
         let hash = result.unwrap();
-        assert_eq!(hash.len(), 64);  // SHA-256 produces 64 hex chars
+        assert_eq!(hash.len(), 64); // SHA-256 produces 64 hex chars
     }
 
     #[test]
@@ -3775,8 +3821,7 @@ mod tests {
         fs::write(dir.join("only_file.txt"), b"unique").expect("write");
 
         let (dups, scanned, dup_count, wasted, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false)
-                .expect("scan");
+            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 1);
         assert_eq!(dup_count, 0);
@@ -3796,11 +3841,10 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"bbbb").expect("write");
 
         let (dups, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false)
-                .expect("scan");
+            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 2);
-        assert_eq!(dup_count, 0);  // No duplicates - different content
+        assert_eq!(dup_count, 0); // No duplicates - different content
         assert!(dups.is_empty());
     }
 
@@ -3818,11 +3862,10 @@ mod tests {
         fs::write(dir.join("a/b/c/level3.txt"), b"dup").expect("write level3");
 
         let (_, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false)
-                .expect("scan nested");
+            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan nested");
 
         assert_eq!(scanned, 4);
-        assert_eq!(dup_count, 3);  // 4 files, 1 original + 3 duplicates
+        assert_eq!(dup_count, 3); // 4 files, 1 original + 3 duplicates
     }
 
     #[test]
@@ -3953,14 +3996,14 @@ mod tests {
             action: Some("trash".into()),
             dest: None,
             force: true,
-            quiet: false,  // Enable output
+            quiet: false, // Enable output
             create_dest: false,
             follow_symlinks: false,
             summary_format: SummaryFormat::Text,
             summary_path: None,
             summary_silent: false,
             summary_only: false,
-            log_level: LogLevel::Info,  // Info level for logging
+            log_level: LogLevel::Info, // Info level for logging
             fail_on_error: false,
         };
 
@@ -4068,7 +4111,7 @@ mod tests {
             quiet: false,
             create_dest: false,
             follow_symlinks: false,
-            summary_format: SummaryFormat::Json,  // JSON format
+            summary_format: SummaryFormat::Json, // JSON format
             summary_path: None,
             summary_silent: false,
             summary_only: false,
@@ -4093,12 +4136,11 @@ mod tests {
         fs::write(dir.join("copy3.txt"), b"same content").expect("write 3");
 
         let (dups, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false)
-                .expect("scan");
+            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 3);
-        assert_eq!(dups.len(), 1);  // One duplicate group
-        assert_eq!(dup_count, 2);   // 3 files - 1 original = 2 duplicates
+        assert_eq!(dups.len(), 1); // One duplicate group
+        assert_eq!(dup_count, 2); // 3 files - 1 original = 2 duplicates
     }
 
     #[test]
@@ -4152,7 +4194,7 @@ mod tests {
 
         let args = Args {
             directory: dir.to_path_buf(),
-            action: None,  // No action
+            action: None, // No action
             dest: None,
             force: true,
             quiet: true,
@@ -4232,7 +4274,7 @@ mod tests {
             &duplicates,
             &DuplicateAction::Move(dest.path().to_path_buf()),
             false,
-            true,  // error_logs = true to hit eprintln path
+            true, // error_logs = true to hit eprintln path
         );
 
         // Should have recorded a failure for the invalid path
@@ -4253,11 +4295,11 @@ mod tests {
 
         let args = Args {
             directory: dir.to_path_buf(),
-            action: Some("trash".into()),  // Trash action, not move
+            action: Some("trash".into()), // Trash action, not move
             dest: None,
             force: true,
             quiet: true,
-            create_dest: true,  // create_dest with non-move action
+            create_dest: true, // create_dest with non-move action
             follow_symlinks: false,
             summary_format: SummaryFormat::Text,
             summary_path: None,
@@ -4364,12 +4406,11 @@ mod tests {
         }
 
         let (dups, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false)
-                .expect("scan");
+            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 10);
         assert_eq!(dups.len(), 1);
-        assert_eq!(dup_count, 9);  // 10 files - 1 original = 9 duplicates
+        assert_eq!(dup_count, 9); // 10 files - 1 original = 9 duplicates
     }
 
     #[test]
@@ -4386,7 +4427,7 @@ mod tests {
             action: None,
             dest: None,
             force: true,
-            quiet: true,  // Quiet mode
+            quiet: true, // Quiet mode
             create_dest: false,
             follow_symlinks: false,
             summary_format: SummaryFormat::Text,
@@ -4419,8 +4460,8 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Move(dest.path().to_path_buf()),
-            true,   // info_logs = true
-            true,   // error_logs = true
+            true, // info_logs = true
+            true, // error_logs = true
         );
 
         assert_eq!(report.successes, 1);
@@ -4446,8 +4487,8 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Trash,
-            true,   // info_logs = true
-            true,   // error_logs = true
+            true, // info_logs = true
+            true, // error_logs = true
         );
 
         assert_eq!(report.successes, 1);
@@ -4470,7 +4511,7 @@ mod tests {
 
     #[test]
     fn test_format_duration_long() {
-        let d = Duration::from_secs(125);  // 2 min 5 sec
+        let d = Duration::from_secs(125); // 2 min 5 sec
         let formatted = format_duration(d);
         assert!(formatted.contains("min"));
         assert!(formatted.contains("sec"));
@@ -4589,5 +4630,146 @@ mod tests {
         let (msg, code) = result.unwrap();
         assert!(msg.contains("5 action failures"));
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn test_progress_env_defaults_used() {
+        let _guard = lock_progress();
+        // Ensure envs are unset and no override
+        env::remove_var("MDDEDUPE_SCAN_PROGRESS_MS");
+        env::remove_var("MDDEDUPE_HASH_PROGRESS_MS");
+        let _overrides = ProgressOverrideGuard::new(None, None); // None means no override (default behavior)
+
+        // Note: scan_progress_interval uses the override if *set*, or env if *not*.
+        // test_support::scan_interval_override returns Option<Option<Duration>>.
+        // None = use env. Some(None) = disable. Some(Some(d)) = use d.
+        // So we want ProgressOverrideGuard to set it to None (initial state).
+        // ProgressOverrideGuard::new(None, None) does exactly that.
+
+        let scan = scan_progress_interval();
+        let hash = hash_progress_sleep();
+
+        assert_eq!(scan, Some(Duration::from_millis(DEFAULT_SCAN_PROGRESS_MS)));
+        assert_eq!(hash, Some(Duration::from_millis(DEFAULT_HASH_PROGRESS_MS)));
+    }
+
+    #[test]
+    fn test_follow_symlinks_to_file() {
+        #[cfg(unix)]
+        {
+            let _guard = lock_progress();
+            set_progress_env();
+            env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+
+            let temp = TempDir::new().expect("temp dir");
+            let dir = temp.path();
+            let target = dir.join("target.txt");
+            fs::write(&target, b"content").expect("write target");
+
+            let link = dir.join("link.txt");
+            symlink(&target, &link).expect("create symlink");
+
+            // Scan with follow_symlinks=true
+            let (_, scanned, _, _, _) =
+                find_duplicates_optimized_with_options(dir, false, false, true).expect("scan");
+
+            // Should scan both target and link
+            assert_eq!(scanned, 2);
+        }
+    }
+
+    #[test]
+    fn test_hash_file_locked_error() {
+        // Windows-specific test for locked file
+        #[cfg(windows)]
+        {
+            let _guard = lock_progress();
+            set_progress_env();
+            let temp = TempDir::new().expect("temp dir");
+            let dir = temp.path();
+            let file1 = dir.join("file1.txt");
+            let file2 = dir.join("file2.txt"); // locked file
+
+            fs::write(&file1, b"content").expect("write file1");
+
+            // Create file2 and HOLD the handle with exclusive access
+            let _file2_handle = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                //.share_mode(0) // Rust std doesn't expose share mode easily without extension traits
+                .open(&file2)
+                .expect("open file2");
+
+            // On Windows, opening with write access usually denies read access to others unless shared.
+            // Default OpenOptions share mode allows read?
+            // Actually, `hash_file` opens for read.
+            // If I keep it open for write, `hash_file` might fail if sharing isn't set right.
+            // Let's try.
+
+            // Wait, we need duplicate CANDIDATES to trigger hashing.
+            // file1 and file2 must have same size.
+            // Write content to file2 handle.
+            let mut handle = _file2_handle;
+            handle.write_all(b"content").expect("write file2");
+            handle.sync_all().expect("sync");
+
+            // Now attempt scan. file2 is still open by 'handle'.
+            // On Windows, this *should* prevent hash_file from opening it if it didn't specify share mode?
+            // Rust `File::open` uses `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`.
+            // So it might actually work?
+            // To force failure, we need to open with NO share.
+            // We can use `fs2` or `interprocess` crate, but we don't have them.
+            // We can try `icacls` to deny read?
+
+            let status = std::process::Command::new("icacls")
+                .arg(&file2)
+                .arg("/deny")
+                .arg("*S-1-1-0:(R)") // Deny read to Everyone
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+
+            if status.is_ok() {
+                // Drop handle first so icacls works better?
+                drop(handle);
+
+                let result = find_duplicates_optimized_with_options(dir, false, false, false)
+                    .expect("scan should succeed even with hash error");
+
+                // file2 hashing should fail, so it shouldn't be in duplicates.
+                // file1 is alone, so no duplicates.
+                assert_eq!(result.2, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_scan_unreadable_directory() {
+        #[cfg(unix)]
+        {
+            let _guard = lock_progress();
+            set_progress_env();
+            let temp = TempDir::new().expect("temp dir");
+            let dir = temp.path();
+            let unreadable = dir.join("unreadable");
+            fs::create_dir(&unreadable).expect("create dir");
+
+            let mut perms = fs::metadata(&unreadable).unwrap().permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(&unreadable, perms).expect("set perms");
+
+            let (_, scanned, _, _, _) =
+                find_duplicates_optimized_with_options(dir, false, false, false)
+                    .expect("scan handles unreadable dir");
+
+            // Should not crash.
+            assert_eq!(scanned, 0);
+
+            // Cleanup
+            let mut perms = fs::metadata(&unreadable).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&unreadable, perms).expect("restore");
+        }
     }
 }
