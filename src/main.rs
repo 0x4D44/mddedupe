@@ -650,6 +650,10 @@ fn find_duplicates_in_dirs(
     // physical file appears at most once BEFORE the len>1 filter and before
     // duplicate_count/wasted_space are computed, so reporting and actions both
     // count an aliased file once and can never act on the survivor itself.
+    //
+    // This must run unconditionally — do NOT gate it on `follow_symlinks`. On
+    // Unix it is also what collapses hardlinks (shared dev+ino) to a single
+    // physical file, which must happen regardless of symlink following.
     for group in duplicates.values_mut() {
         collapse_group_by_identity(group);
     }
