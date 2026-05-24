@@ -111,10 +111,50 @@ When running tests, progress is typically disabled via environment variables to 
 - `MDDEDUPE_HASH_PROGRESS_MS`: Progress update interval for hash stage (default: 500ms, set to 0 to disable)
 - `MDDEDUPE_PROGRESS_FAIL`: Internal test hook for simulating progress failures (used in tests only)
 
+## Multi-Path Scanning
+
+`mddedupe` accepts **one or more** directories in a single run and finds
+duplicates **across** all of them (e.g. `mddedupe X:\ Y:\`). The single-path
+case behaves exactly as before.
+
+- **Origin tracking**: Each file carries a `root_index` (the position of the
+  supplied directory it was discovered under, 0 = first listed). Priority is
+  assigned at discovery time rather than reconstructed by path-prefix matching.
+- **Survivor preference (first-listed path wins)**: Within each duplicate group
+  the survivor is chosen by `survivor_cmp` — lowest `root_index` first, then
+  alphabetical path. The same comparator drives both the acted-on survivor in
+  `process_duplicates` and the read-only display order, so they can never drift.
+- **Overlap rejection** (`detect_overlap`): If one supplied path is inside
+  another (or the same path is given twice), the run is rejected before any
+  scanning with `AppError::OverlappingPaths` (exit 1). Detection compares
+  best-effort **canonicalized** paths, so symlink/junction aliases of a root are
+  caught, not just lexical nesting.
+- **Identity safety net** (`collapse_group_by_identity`): After hashing — and
+  **before** the `len > 1` filter and the duplicate-count/wasted-space tally —
+  each hash group is collapsed by `FileId` so a single physical file appears at
+  most once. Among entries sharing a `FileId`, the one preferred by `survivor_cmp`
+  (lowest `root_index`, then path) is kept; an entry whose metadata cannot be
+  read is treated as distinct and never dropped. This guarantees a physical file
+  reachable through more than one path (symlink/junction, or a real file plus a
+  `--follow-symlinks` view of itself) counts once and can never be both the
+  survivor and an acted-on duplicate. The collapse touches only already-filtered
+  candidate groups (tiny), so there is no hot-loop cost.
+- **Hardlinks (intended Unix/Windows asymmetry)**: Because identity is the
+  `FileId`, on **Unix** multiple hardlinks to one inode share a `FileId`
+  (`dev`+`ino`) and collapse to a single entry — they are counted once and never
+  unlinked. This is correct for a space-reclaiming deduper: hardlinks share a
+  single physical extent, so deleting one link reclaims no space and removing the
+  last link would destroy the only copy, keeping `wasted_bytes` honest. On
+  **Windows** identity is the canonical path and each NTFS hardlink canonicalizes
+  to its own path, so hardlinks are **not** collapsed and are treated as ordinary
+  duplicates. This asymmetry is intentional; Windows hardlink detection
+  (`GetFileInformationByHandle`) is out of scope.
+
 ## CLI Argument Structure
 
 Uses `clap` with derive macros:
-- **Required**: `directory` - Path to scan
+- **Required**: `directories` - One or more paths to scan (variadic positional,
+  `num_args = 1..`). Duplicates are found across all supplied directories.
 - **Actions**: `--action {move|trash|delete}` - Defaults to read-only if omitted
 - **Move options**: `--dest DIR`, `--create-dest`
 - **Output control**: `--quiet`, `--summary-format {text|json}`, `--summary-path FILE`, `--summary-silent`, `--summary-only`

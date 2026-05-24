@@ -25,13 +25,29 @@ enum FileId {
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CTRL_C_STATUS: OnceLock<Mutex<CtrlCStatus>> = OnceLock::new();
 
-/// A tool to scan a directory tree and identify duplicate files.
-/// By default the tool runs in read‑only mode.
+/// A member of a duplicate group: its path, size in bytes, and the index of the
+/// supplied directory it was discovered under (0 = first directory listed).
+type DuplicateEntry = (PathBuf, u64, usize);
+
+/// Orders members of a duplicate group so the survivor sorts first: the file on
+/// the earliest-listed directory (lowest `root_index`) wins, with ties broken by
+/// alphabetical path order. Shared between the acted-on survivor selection in
+/// `process_duplicates` and the read-only display path so the two can never drift.
+fn survivor_cmp(a: &DuplicateEntry, b: &DuplicateEntry) -> std::cmp::Ordering {
+    let (path_a, _, root_a) = a;
+    let (path_b, _, root_b) = b;
+    root_a.cmp(root_b).then_with(|| path_a.cmp(path_b))
+}
+
+/// A tool to scan one or more directory trees and identify duplicate files.
+/// Duplicates are found across all supplied directories; by default the tool
+/// runs in read‑only mode.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Directory to scan
-    directory: PathBuf,
+    /// One or more directories to scan
+    #[arg(required = true, num_args = 1..)]
+    directories: Vec<PathBuf>,
 
     /// Action to perform on duplicates: "move", "trash" or "delete". If not specified the tool is read‑only.
     #[arg(short = 'a', long)]
@@ -307,6 +323,41 @@ mod test_support {
     }
 }
 
+/// Detects whether any supplied path overlaps another (one is inside the other,
+/// or they are identical). Returns the first overlap found as `(outer, inner)`
+/// using the ORIGINAL (as-supplied) paths, or `None` if all paths are disjoint.
+///
+/// Comparison is done on best-effort canonicalized forms (`fs::canonicalize`,
+/// falling back to the raw path when canonicalization fails, e.g. the path does
+/// not exist yet). Canonicalizing both sides resolves symlinks and junctions, so
+/// roots that alias each other are caught, not just lexical nesting.
+fn detect_overlap(dirs: &[PathBuf]) -> Option<(PathBuf, PathBuf)> {
+    let canonical: Vec<PathBuf> = dirs
+        .iter()
+        // Canonicalize so symlink/junction aliases and case-insensitive Windows
+        // paths that resolve to the same physical root are caught. When a path
+        // does not exist, canonicalization fails and we fall back to the raw
+        // path; a nested overlap with such a nonexistent path may then be
+        // missed, but a nonexistent path contributes no files, so there is no
+        // data hazard.
+        .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()))
+        .collect();
+
+    for i in 0..dirs.len() {
+        for j in 0..dirs.len() {
+            if i == j {
+                continue;
+            }
+            // dirs[i] is the outer path if dirs[j]'s canonical form is nested
+            // inside (or equal to) dirs[i]'s canonical form.
+            if canonical[j].starts_with(&canonical[i]) {
+                return Some((dirs[i].clone(), dirs[j].clone()));
+            }
+        }
+    }
+    None
+}
+
 /// Computes the SHA‑256 hash of a file by reading it in chunks.
 /// Uses a 16‑KB buffer for improved I/O performance.
 fn hash_file(path: &Path) -> io::Result<String> {
@@ -324,104 +375,157 @@ fn hash_file(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Collapses a single hash group so that each distinct physical file (`FileId`)
+/// appears at most once. This is the identity safety net (HLD §5.4): overlap
+/// rejection is lexical at the root level and does not stop the same physical
+/// file from entering a group twice via a symlink or junction discovered
+/// mid-walk (e.g. a real file plus a `--follow-symlinks` view of itself). Acting
+/// on such a "duplicate" would destroy the data the survivor points at.
+///
+/// For each entry we resolve its `FileId` via `fs::metadata` and keep exactly one
+/// entry per distinct identity. Among entries sharing an identity, the survivor
+/// preference is preserved by keeping the one that sorts first under
+/// `survivor_cmp` (lowest `root_index`, then alphabetical path). An entry whose
+/// metadata cannot be read is treated as having a distinct identity and is never
+/// collapsed away — it is safer to keep it than to silently drop it.
+///
+/// This runs only over already-filtered candidate groups (tiny), so there is no
+/// hot-loop cost.
+fn collapse_group_by_identity(group: &mut Vec<DuplicateEntry>) {
+    let mut seen: HashMap<FileId, usize> = HashMap::new();
+    let mut distinct: Vec<DuplicateEntry> = Vec::with_capacity(group.len());
+    for entry in group.drain(..) {
+        let id = match fs::metadata(&entry.0) {
+            Ok(metadata) => Some(file_id_from_metadata(&entry.0, &metadata)),
+            Err(_) => None,
+        };
+        match id {
+            Some(id) => match seen.get(&id).copied() {
+                Some(index) => {
+                    // Already have a representative for this physical file; keep
+                    // whichever entry sorts first so the survivor preference holds.
+                    if survivor_cmp(&entry, &distinct[index]) == std::cmp::Ordering::Less {
+                        distinct[index] = entry;
+                    }
+                }
+                None => {
+                    seen.insert(id, distinct.len());
+                    distinct.push(entry);
+                }
+            },
+            // Unreadable metadata: treat as a distinct identity, never collapse away.
+            None => distinct.push(entry),
+        }
+    }
+    *group = distinct;
+}
+
 /// Scans the directory tree, groups files by size, and then for each group with more than one file,
 /// computes the file hash in parallel. While hashing, a progress indicator shows how many candidate
 /// files have been processed (on a single line in-place).
 ///
 /// Returns:
-/// - A map from hash to a vector of (file path, file size)
+/// - A map from hash to a vector of (file path, file size, root index)
 /// - The total number of files scanned
 /// - The duplicate count (excluding the first file in each duplicate group)
 /// - The total wasted space (sum of sizes for duplicate files)
 /// - The elapsed time
+///
+/// Each file is tagged with the index of the supplied directory it was
+/// discovered under (0 = first directory). The scanned-file counter and
+/// progress reporting accumulate across all directories; the "Filesystem scan
+/// complete" line is printed once after every directory has been walked.
 #[allow(clippy::type_complexity)]
-fn find_duplicates_optimized_with_options(
-    dir: &Path,
+fn find_duplicates_in_dirs(
+    dirs: &[PathBuf],
     emit_text: bool,
     show_progress: bool,
     follow_symlinks: bool,
 ) -> io::Result<(
-    HashMap<String, Vec<(PathBuf, u64)>>,
+    HashMap<String, Vec<DuplicateEntry>>,
     usize,
     usize,
     u64,
     Duration,
 )> {
     let start = Instant::now();
-    let mut size_map: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    let mut size_map: HashMap<u64, Vec<(PathBuf, usize)>> = HashMap::new();
     let mut scanned_files = 0usize;
     let mut last_update = Instant::now();
     let scan_interval = scan_progress_interval();
     let progress_allowed = Arc::new(AtomicBool::new(show_progress && scan_interval.is_some()));
 
-    // Stage 1: Walk the directory and group files by their size.
-    let walker: Box<dyn Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>>> =
-        if follow_symlinks {
-            let mut visited: HashSet<FileId> = HashSet::new();
-            Box::new(
-                WalkDir::new(dir)
-                    .follow_links(true)
-                    .into_iter()
-                    .filter_entry(move |entry| {
-                        let file_type = entry.file_type();
-                        if !(file_type.is_dir() || file_type.is_symlink()) {
-                            return true;
-                        }
-                        match entry.path().metadata() {
-                            Ok(metadata) => {
-                                if !metadata.is_dir() {
-                                    return true;
+    // Stage 1: Walk each directory and group files by their size, recording the
+    // index of the directory each file came from.
+    for (root_index, dir) in dirs.iter().enumerate() {
+        let walker: Box<dyn Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>>> =
+            if follow_symlinks {
+                let mut visited: HashSet<FileId> = HashSet::new();
+                Box::new(
+                    WalkDir::new(dir)
+                        .follow_links(true)
+                        .into_iter()
+                        .filter_entry(move |entry| {
+                            let file_type = entry.file_type();
+                            if !(file_type.is_dir() || file_type.is_symlink()) {
+                                return true;
+                            }
+                            match entry.path().metadata() {
+                                Ok(metadata) => {
+                                    if !metadata.is_dir() {
+                                        return true;
+                                    }
+                                    let id = file_id_from_metadata(entry.path(), &metadata);
+                                    visited.insert(id)
                                 }
-                                let id = file_id_from_metadata(entry.path(), &metadata);
-                                visited.insert(id)
+                                Err(err) => {
+                                    eprintln!(
+                                        "Warning: unable to read metadata for {}: {}",
+                                        entry.path().display(),
+                                        err
+                                    );
+                                    false
+                                }
                             }
-                            Err(err) => {
-                                eprintln!(
-                                    "Warning: unable to read metadata for {}: {}",
-                                    entry.path().display(),
-                                    err
-                                );
-                                false
-                            }
-                        }
-                    }),
-            )
-        } else {
-            Box::new(WalkDir::new(dir).follow_links(false).into_iter())
-        };
+                        }),
+                )
+            } else {
+                Box::new(WalkDir::new(dir).follow_links(false).into_iter())
+            };
 
-    for entry in walker {
-        if cancellation_requested() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "filesystem scan cancelled",
-            ));
-        }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("Error reading entry: {}", e);
-                continue;
+        for entry in walker {
+            if cancellation_requested() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "filesystem scan cancelled",
+                ));
             }
-        };
-        if entry.file_type().is_file() {
-            scanned_files += 1;
-            if let Ok(metadata) = entry.metadata() {
-                size_map
-                    .entry(metadata.len())
-                    .or_default()
-                    .push(entry.path().to_path_buf());
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("Error reading entry: {}", e);
+                    continue;
+                }
+            };
+            if entry.file_type().is_file() {
+                scanned_files += 1;
+                if let Ok(metadata) = entry.metadata() {
+                    size_map
+                        .entry(metadata.len())
+                        .or_default()
+                        .push((entry.path().to_path_buf(), root_index));
+                }
             }
-        }
-        if show_progress
-            && progress_allowed.load(Ordering::SeqCst)
-            && scan_interval
-                .map(|interval| last_update.elapsed() >= interval)
-                .unwrap_or(false)
-        {
-            let message = format!("\rScanning filesystem - found {} files...", scanned_files);
-            handle_progress_result(write_progress_line(&message), &progress_allowed)?;
-            last_update = Instant::now();
+            if show_progress
+                && progress_allowed.load(Ordering::SeqCst)
+                && scan_interval
+                    .map(|interval| last_update.elapsed() >= interval)
+                    .unwrap_or(false)
+            {
+                let message = format!("\rScanning filesystem - found {} files...", scanned_files);
+                handle_progress_result(write_progress_line(&message), &progress_allowed)?;
+                last_update = Instant::now();
+            }
         }
     }
 
@@ -447,7 +551,7 @@ fn find_duplicates_optimized_with_options(
     }
 
     // Stage 2: Process candidate groups.
-    let candidate_groups: Vec<(u64, Vec<PathBuf>)> = size_map
+    let candidate_groups: Vec<(u64, Vec<(PathBuf, usize)>)> = size_map
         .into_iter()
         .filter(|(_, files)| files.len() > 1)
         .collect();
@@ -496,7 +600,7 @@ fn find_duplicates_optimized_with_options(
         None
     };
 
-    let mut duplicates: HashMap<String, Vec<(PathBuf, u64)>> = HashMap::new();
+    let mut duplicates: HashMap<String, Vec<DuplicateEntry>> = HashMap::new();
     for (size, files) in candidate_groups {
         if cancellation_requested() {
             return Err(io::Error::new(
@@ -504,15 +608,15 @@ fn find_duplicates_optimized_with_options(
                 "hashing cancelled",
             ));
         }
-        let hash_results: Vec<(PathBuf, String)> = files
+        let hash_results: Vec<(PathBuf, usize, String)> = files
             .into_par_iter()
-            .filter_map(|path| {
+            .filter_map(|(path, root_index)| {
                 if cancellation_requested() {
                     return None;
                 }
                 candidate_processed.fetch_add(1, Ordering::Relaxed);
                 match hash_file(&path) {
-                    Ok(hash) => Some((path, hash)),
+                    Ok(hash) => Some((path, root_index, hash)),
                     Err(e) => {
                         eprintln!("Error hashing {}: {}", path.display(), e);
                         None
@@ -521,8 +625,11 @@ fn find_duplicates_optimized_with_options(
             })
             .collect();
 
-        for (path, hash) in hash_results {
-            duplicates.entry(hash).or_default().push((path, size));
+        for (path, root_index, hash) in hash_results {
+            duplicates
+                .entry(hash)
+                .or_default()
+                .push((path, size, root_index));
         }
     }
 
@@ -539,13 +646,21 @@ fn find_duplicates_optimized_with_options(
         return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
     }
 
+    // Identity safety net (HLD §5.4): collapse each hash group so a single
+    // physical file appears at most once BEFORE the len>1 filter and before
+    // duplicate_count/wasted_space are computed, so reporting and actions both
+    // count an aliased file once and can never act on the survivor itself.
+    for group in duplicates.values_mut() {
+        collapse_group_by_identity(group);
+    }
+
     duplicates.retain(|_, group| group.len() > 1);
 
     let mut duplicate_count = 0;
     let mut wasted_space = 0;
     for group in duplicates.values() {
         duplicate_count += group.len() - 1;
-        wasted_space += group.iter().skip(1).map(|(_, size)| *size).sum::<u64>();
+        wasted_space += group.iter().skip(1).map(|(_, size, _)| *size).sum::<u64>();
     }
     let elapsed = start.elapsed();
     Ok((
@@ -651,7 +766,7 @@ impl ProcessReport {
 
 #[derive(Serialize)]
 struct JsonSummary {
-    directory: String,
+    directories: Vec<String>,
     scanned_files: usize,
     duplicate_files: usize,
     duplicate_wasted_bytes: u64,
@@ -891,6 +1006,7 @@ enum AppError {
     Cancelled,
     UnknownAction(String),
     ActionFailures(usize),
+    OverlappingPaths(PathBuf, PathBuf),
 }
 
 impl From<io::Error> for AppError {
@@ -906,7 +1022,7 @@ impl From<io::Error> for AppError {
 /// Processes duplicates by applying the selected action to every file in each duplicate group except the first.
 /// For each file processed, updated status information is printed and aggregated into a report.
 fn process_duplicates(
-    duplicates: &HashMap<String, Vec<(PathBuf, u64)>>,
+    duplicates: &HashMap<String, Vec<DuplicateEntry>>,
     action: &DuplicateAction,
     info_logs: bool,
     error_logs: bool,
@@ -923,14 +1039,16 @@ fn process_duplicates(
         if files.len() <= 1 {
             continue;
         }
+        // Keep the survivor on the earliest-listed directory; ties fall back to
+        // alphabetical path order.
         let mut sorted_files = files.clone();
-        sorted_files.sort_by(|(path_a, _), (path_b, _)| path_a.cmp(path_b));
+        sorted_files.sort_by(survivor_cmp);
         if info_logs {
             println!(
                 "{}",
                 ansi_fixed(8, format!("Duplicate group (hash: {}):", hash))
             );
-            for (i, (path, size)) in sorted_files.iter().enumerate() {
+            for (i, (path, size, _)) in sorted_files.iter().enumerate() {
                 println!(
                     "  {}: {} ({})",
                     i + 1,
@@ -941,7 +1059,7 @@ fn process_duplicates(
         }
 
         // Process duplicate group: skip the first file.
-        for (path, size) in sorted_files.iter().skip(1) {
+        for (path, size, _) in sorted_files.iter().skip(1) {
             if cancellation_requested() {
                 return report;
             }
@@ -1009,6 +1127,13 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
     install_ctrlc_handler()?;
     reset_cancellation_flag();
 
+    // Reject overlapping input paths before any filesystem scan or destructive
+    // work, so a physical file reachable through more than one supplied path can
+    // never reach the move/trash/delete path.
+    if let Some((outer, inner)) = detect_overlap(&args.directories) {
+        return Err(AppError::OverlappingPaths(outer, inner));
+    }
+
     let summary_stdout = args.summary_format == SummaryFormat::Text && !args.summary_silent;
     let log_output = !args.summary_only && !args.quiet && matches!(args.log_level, LogLevel::Info);
     let warn_logs = !args.summary_only
@@ -1052,19 +1177,21 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
     }
 
     if summary_stdout {
-        println!(
-            "Starting duplicate scan in directory: {}",
-            args.directory.display()
-        );
+        let joined = args
+            .directories
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Starting duplicate scan in: {}", joined);
     }
 
-    let (duplicates, scanned, duplicate_count, wasted, elapsed) =
-        find_duplicates_optimized_with_options(
-            &args.directory,
-            summary_stdout,
-            show_progress,
-            args.follow_symlinks,
-        )?;
+    let (duplicates, scanned, duplicate_count, wasted, elapsed) = find_duplicates_in_dirs(
+        &args.directories,
+        summary_stdout,
+        show_progress,
+        args.follow_symlinks,
+    )?;
     if summary_stdout {
         println!(
             "Duplicate scan completed in {}. {} files scanned, {} duplicates found ({} wasted).",
@@ -1076,17 +1203,21 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
     }
 
     if log_output {
-        let mut groups: Vec<(&String, &Vec<(PathBuf, u64)>)> = duplicates
+        let mut groups: Vec<(&String, &Vec<DuplicateEntry>)> = duplicates
             .iter()
             .filter(|(_, group)| group.len() > 1)
             .collect();
-        groups.sort_by_key(|(_, group)| group.iter().skip(1).map(|(_, size)| *size).sum::<u64>());
+        groups
+            .sort_by_key(|(_, group)| group.iter().skip(1).map(|(_, size, _)| *size).sum::<u64>());
         for (hash, group) in groups {
             println!(
                 "{}",
                 ansi_fixed(8, format!("Duplicate group (hash: {}):", hash))
             );
-            for (path, size) in group {
+            // Print the survivor first by sorting each group by (root_index, path).
+            let mut sorted_group = group.clone();
+            sorted_group.sort_by(survivor_cmp);
+            for (path, size, _) in &sorted_group {
                 println!("  {} ({})", path.display(), human_readable(*size));
             }
         }
@@ -1232,7 +1363,11 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         });
 
         let json_summary = JsonSummary {
-            directory: args.directory.display().to_string(),
+            directories: args
+                .directories
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
             scanned_files: scanned,
             duplicate_files: duplicate_count,
             duplicate_wasted_bytes: wasted,
@@ -1316,6 +1451,14 @@ fn format_app_error(err: &AppError) -> Option<(String, i32)> {
             ),
             2,
         )),
+        AppError::OverlappingPaths(outer, inner) => Some((
+            format!(
+                "path '{}' is inside '{}'. Pass non-overlapping paths.",
+                inner.display(),
+                outer.display()
+            ),
+            1,
+        )),
     }
 }
 
@@ -1362,6 +1505,24 @@ mod tests {
         progress_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Single-directory convenience wrapper that delegates to the multi-path
+    /// scanner so existing single-directory tests stay unchanged.
+    #[allow(clippy::type_complexity)]
+    fn scan_one(
+        dir: &Path,
+        emit_text: bool,
+        show_progress: bool,
+        follow: bool,
+    ) -> io::Result<(
+        HashMap<String, Vec<DuplicateEntry>>,
+        usize,
+        usize,
+        u64,
+        Duration,
+    )> {
+        find_duplicates_in_dirs(&[dir.to_path_buf()], emit_text, show_progress, follow)
     }
 
     fn set_progress_env() {
@@ -1489,8 +1650,7 @@ mod tests {
         fs::write(&file1, b"duplicate").expect("Failed to write file1");
         fs::write(&file2, b"duplicate").expect("Failed to write file2");
 
-        let result = find_duplicates_optimized_with_options(dir, true, true, false)
-            .expect("Progress reporting should succeed");
+        let result = scan_one(dir, true, true, false).expect("Progress reporting should succeed");
         assert_eq!(result.1, 2);
         assert_eq!(result.2, 1);
     }
@@ -1500,7 +1660,7 @@ mod tests {
         let _lock = lock_progress();
         let _cancel_guard = CancelFlagGuard::force_cancel();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        let err = find_duplicates_optimized_with_options(temp_dir.path(), false, false, false)
+        let err = scan_one(temp_dir.path(), false, false, false)
             .expect_err("Expected cancellation to surface");
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
     }
@@ -1519,8 +1679,7 @@ mod tests {
         fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
         fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
 
-        let result = find_duplicates_optimized_with_options(dir, true, true, false)
-            .expect("Broken pipe should be handled");
+        let result = scan_one(dir, true, true, false).expect("Broken pipe should be handled");
         assert_eq!(result.2, 1);
 
         env::remove_var("MDDEDUPE_PROGRESS_FAIL");
@@ -1536,7 +1695,7 @@ mod tests {
         fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
         fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
 
-        let result = find_duplicates_optimized_with_options(dir, false, true, false)
+        let result = scan_one(dir, false, true, false)
             .expect("IO errors in hashing progress should be logged and ignored");
         assert_eq!(result.2, 1);
 
@@ -1553,7 +1712,7 @@ mod tests {
         fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
         fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
 
-        let err = find_duplicates_optimized_with_options(dir, false, true, false)
+        let err = scan_one(dir, false, true, false)
             .expect_err("Cancellation during hashing should surface");
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
 
@@ -1580,8 +1739,7 @@ mod tests {
         perms.set_mode(0o000);
         fs::set_permissions(&file2, perms).expect("Failed to tighten perms");
 
-        let result = find_duplicates_optimized_with_options(dir, false, false, false)
-            .expect("Hash errors should be ignored");
+        let result = scan_one(dir, false, false, false).expect("Hash errors should be ignored");
         assert_eq!(result.2, 0, "Failed hashes should drop duplicates");
     }
 
@@ -1598,7 +1756,7 @@ mod tests {
         fs::write(dir.join("file1.txt"), b"dup").expect("Failed to write file1");
         fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
 
-        let err = find_duplicates_optimized_with_options(dir, false, false, false)
+        let err = scan_one(dir, false, false, false)
             .expect_err("Cancellation hook should stop processing");
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
         reset_cancellation_flag();
@@ -1785,7 +1943,7 @@ mod tests {
         }
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(dest_path.to_path_buf()),
             force: true,
@@ -1815,7 +1973,7 @@ mod tests {
         let loop_path = temp_dir.path().join("loop");
         symlink(temp_dir.path(), &loop_path).expect("Failed to create self-referential symlink");
 
-        let result = find_duplicates_optimized_with_options(temp_dir.path(), true, true, true)
+        let result = scan_one(temp_dir.path(), true, true, true)
             .expect("Scan with symlink loop should complete");
         let (_, scanned, dup_count, wasted, _) = result;
         assert_eq!(scanned, 0);
@@ -1833,7 +1991,7 @@ mod tests {
         let broken = temp_dir.path().join("broken");
         symlink(temp_dir.path().join("missing"), &broken).expect("Failed to create broken symlink");
 
-        let result = find_duplicates_optimized_with_options(temp_dir.path(), true, true, true)
+        let result = scan_one(temp_dir.path(), true, true, true)
             .expect("Scan with broken symlink should complete");
         let (_, scanned, dup_count, wasted, _) = result;
         assert_eq!(scanned, 0);
@@ -1893,12 +2051,12 @@ mod tests {
         let dest_dir = temp_dir.path().join("dest");
         fs::create_dir(&dest_dir).expect("Failed to create destination directory");
 
-        let mut duplicates: HashMap<String, Vec<(PathBuf, u64)>> = HashMap::new();
+        let mut duplicates: HashMap<String, Vec<(PathBuf, u64, usize)>> = HashMap::new();
         duplicates.insert(
             "hash".into(),
             vec![
-                (temp_dir.path().join("original.txt"), 5),
-                (PathBuf::new(), 5),
+                (temp_dir.path().join("original.txt"), 5, 0),
+                (PathBuf::new(), 5, 0),
             ],
         );
 
@@ -1951,7 +2109,7 @@ mod tests {
         perms.set_mode(0o000);
         fs::set_permissions(&restricted, perms).expect("Failed to tighten permissions");
 
-        let result = find_duplicates_optimized_with_options(temp_dir.path(), true, false, false);
+        let result = scan_one(temp_dir.path(), true, false, false);
         assert!(result.is_ok());
 
         // Restore permissions for cleanup.
@@ -1975,8 +2133,8 @@ mod tests {
         fs::write(&file1, b"duplicate").expect("Failed to write file1");
         fs::write(&file2, b"duplicate").expect("Failed to write file2");
 
-        let result = find_duplicates_optimized_with_options(dir, true, true, false)
-            .expect("Progress broken pipe should be handled");
+        let result =
+            scan_one(dir, true, true, false).expect("Progress broken pipe should be handled");
         assert_eq!(result.2, 1);
 
         env::remove_var("MDDEDUPE_PROGRESS_FAIL");
@@ -1989,7 +2147,7 @@ mod tests {
         env::set_var("MDDEDUPE_PROGRESS_FAIL", "io_error");
 
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        let result = find_duplicates_optimized_with_options(temp_dir.path(), true, true, false);
+        let result = scan_one(temp_dir.path(), true, true, false);
         let err = result.expect_err("Expected IO error to propagate");
         assert_eq!(err.kind(), io::ErrorKind::Other);
 
@@ -2010,7 +2168,7 @@ mod tests {
         fs::write(&file2, b"duplicate").expect("Failed to write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None,
             dest: None,
             force: true,
@@ -2044,8 +2202,7 @@ mod tests {
         fs::write(&file1, b"duplicate").expect("Failed to write file1");
         fs::write(&file2, b"duplicate").expect("Failed to write file2");
 
-        let result = find_duplicates_optimized_with_options(dir, true, true, false)
-            .expect("Progress should succeed");
+        let result = scan_one(dir, true, true, false).expect("Progress should succeed");
         assert_eq!(result.2, 1);
     }
 
@@ -2061,7 +2218,7 @@ mod tests {
         fs::write(&file2, b"duplicate").expect("Failed to write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".to_string()),
             dest: None,
             force: false,
@@ -2094,7 +2251,7 @@ mod tests {
         fs::write(&file2, b"duplicate").expect("Failed to write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".to_string()),
             dest: None,
             force: true,
@@ -2138,7 +2295,7 @@ mod tests {
         fs::write(dest_path.join("file2.txt"), b"existing").expect("Failed to create collision");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".to_string()),
             dest: Some(dest_path.clone()),
             force: true,
@@ -2195,7 +2352,7 @@ mod tests {
         assert!(!dest_path.exists());
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".to_string()),
             dest: Some(dest_path.clone()),
             force: true,
@@ -2227,7 +2384,7 @@ mod tests {
         fs::write(dir.join("file.txt"), b"data").expect("Failed to write file");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None,
             dest: None,
             force: true,
@@ -2259,7 +2416,7 @@ mod tests {
         fs::write(&file2, b"duplicate").expect("Failed to write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("trash".to_string()),
             dest: None,
             force: true,
@@ -2302,7 +2459,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"duplicate").expect("Failed to write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".to_string()),
             dest: None,
             force: true,
@@ -2331,7 +2488,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"duplicate").expect("Failed to write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("compress".to_string()),
             dest: None,
             force: true,
@@ -2363,7 +2520,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None,
             dest: None,
             force: true,
@@ -2393,7 +2550,7 @@ mod tests {
         let summary_path = temp_dir.path().join("summary.json");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".to_string()),
             dest: None,
             force: true,
@@ -2426,7 +2583,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None,
             dest: None,
             force: true,
@@ -2455,7 +2612,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("Failed to write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".to_string()),
             dest: None,
             force: false,
@@ -2492,7 +2649,7 @@ mod tests {
         fs::set_permissions(dir, perms).expect("Failed to restrict dir permissions");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".to_string()),
             dest: None,
             force: true,
@@ -2562,8 +2719,7 @@ mod tests {
         }
 
         let (duplicates, scanned, _dup_count, wasted_space, elapsed) =
-            find_duplicates_optimized_with_options(dir_path, true, false, false)
-                .expect("Failed to find duplicates");
+            scan_one(dir_path, true, false, false).expect("Failed to find duplicates");
 
         // All three files should be scanned.
         assert_eq!(scanned, 3);
@@ -2617,7 +2773,10 @@ mod tests {
             .len();
         duplicates.insert(
             hash,
-            vec![(file1_path.clone(), size1), (file2_path.clone(), size2)],
+            vec![
+                (file1_path.clone(), size1, 0),
+                (file2_path.clone(), size2, 0),
+            ],
         );
 
         let report = process_duplicates(&duplicates, &DuplicateAction::Delete, true, true);
@@ -2664,7 +2823,10 @@ mod tests {
             .len();
         duplicates.insert(
             hash,
-            vec![(file1_path.clone(), size1), (file2_path.clone(), size2)],
+            vec![
+                (file1_path.clone(), size1, 0),
+                (file2_path.clone(), size2, 0),
+            ],
         );
 
         let report = process_duplicates(
@@ -2715,7 +2877,10 @@ mod tests {
             .len();
         duplicates.insert(
             hash,
-            vec![(file1_path.clone(), size1), (file2_path.clone(), size2)],
+            vec![
+                (file1_path.clone(), size1, 0),
+                (file2_path.clone(), size2, 0),
+            ],
         );
 
         let trash_dir = TempDir::new().expect("Failed to create trash directory");
@@ -2763,7 +2928,10 @@ mod tests {
             .len();
         duplicates.insert(
             hash,
-            vec![(file1_path.clone(), size1), (file2_path.clone(), size2)],
+            vec![
+                (file1_path.clone(), size1, 0),
+                (file2_path.clone(), size2, 0),
+            ],
         );
 
         let dest_dir = TempDir::new().expect("Failed to create destination directory");
@@ -2802,8 +2970,8 @@ mod tests {
         duplicates.insert(
             hash,
             vec![
-                (dir_path.join("file1.txt"), 3),
-                (dir_path.join("file2.txt"), 3),
+                (dir_path.join("file1.txt"), 3, 0),
+                (dir_path.join("file2.txt"), 3, 0),
             ],
         );
 
@@ -2840,13 +3008,11 @@ mod tests {
         symlink(external_dir, &symlink_path).expect("Failed to create symlink");
 
         let (_, _, dup_count_no_links, _, _) =
-            find_duplicates_optimized_with_options(dir, true, false, false)
-                .expect("Failed to scan without symlinks");
+            scan_one(dir, true, false, false).expect("Failed to scan without symlinks");
         assert_eq!(dup_count_no_links, 0);
 
         let (_, _, dup_count_with_links, _, _) =
-            find_duplicates_optimized_with_options(dir, true, false, true)
-                .expect("Failed to scan with symlinks");
+            scan_one(dir, true, false, true).expect("Failed to scan with symlinks");
         assert_eq!(dup_count_with_links, 1);
     }
 
@@ -2985,6 +3151,181 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_collapse_group_by_identity_keeps_one_per_physical_file() {
+        // Two paths that resolve to the SAME physical file (real path plus an
+        // equivalent path through `subdir/..`) share a FileId on every platform
+        // (dev+ino on Unix, canonical path on Windows). The collapse must keep
+        // exactly one entry, preferring the lowest root_index.
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::create_dir(dir.join("subdir")).expect("create subdir");
+        let real = dir.join("file.txt");
+        fs::write(&real, b"payload").expect("write file");
+        let alias = dir.join("subdir").join("..").join("file.txt");
+
+        // alias listed under a LATER root_index than the real path; the survivor
+        // preference (lowest root_index) must keep the real path entry.
+        let mut group: Vec<DuplicateEntry> = vec![(alias.clone(), 7, 1), (real.clone(), 7, 0)];
+        collapse_group_by_identity(&mut group);
+
+        assert_eq!(group.len(), 1, "aliased physical file must collapse to one");
+        assert_eq!(group[0].2, 0, "lowest root_index entry must be kept");
+    }
+
+    #[test]
+    fn test_collapse_group_by_identity_preserves_distinct_and_unreadable() {
+        // Two genuinely distinct files must both survive the collapse; an entry
+        // whose metadata cannot be read (nonexistent path) must NOT be dropped.
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        fs::write(&f1, b"payload").expect("write a");
+        fs::write(&f2, b"payload").expect("write b");
+        let missing = dir.join("does_not_exist.txt");
+
+        let mut group: Vec<DuplicateEntry> = vec![
+            (f1.clone(), 7, 0),
+            (f2.clone(), 7, 0),
+            (missing.clone(), 7, 0),
+        ];
+        collapse_group_by_identity(&mut group);
+
+        assert_eq!(
+            group.len(),
+            3,
+            "distinct files and an unreadable entry must all be retained"
+        );
+    }
+
+    /// On Unix, two hardlinks to the same inode share a `FileId` (`dev`+`ino`),
+    /// so the identity collapse treats them as ONE physical file: they must not
+    /// be reported as duplicates (a hardlink shares storage — deleting one link
+    /// frees nothing), and an `--action delete --force` run must leave BOTH link
+    /// paths intact. This pins the intended hardlink behavior documented in
+    /// HLD §5.4 / ARCHITECTURE.md. (Windows uses canonical-path identity, where
+    /// each NTFS hardlink is its own path, so this property is Unix-specific.)
+    #[test]
+    #[cfg(unix)]
+    fn test_unix_hardlinks_not_duplicates_and_survive_delete() {
+        let _guard = lock_progress();
+        set_progress_env();
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let link_a = dir.join("link_a.txt");
+        let link_b = dir.join("link_b.txt");
+        fs::write(&link_a, b"hardlinked payload").expect("write link_a");
+        fs::hard_link(&link_a, &link_b).expect("create hardlink");
+
+        // Read-only scan: the two links share an inode, so after the identity
+        // collapse the group has a single member and is dropped by the len>1
+        // filter. No duplicates, no wasted space, no duplicate groups.
+        let (groups, scanned, duplicate_count, wasted, _) =
+            scan_one(dir, false, false, false).expect("scan");
+        assert_eq!(scanned, 2, "both link paths are walked");
+        assert_eq!(
+            duplicate_count, 0,
+            "hardlinks to one inode must not be reported as duplicates"
+        );
+        assert_eq!(wasted, 0, "a hardlink shares storage, so wastes nothing");
+        assert!(
+            groups.is_empty(),
+            "no duplicate groups should remain after identity collapse"
+        );
+
+        // Destructive run: nothing should be unlinked.
+        let args = Args {
+            directories: vec![dir.to_path_buf()],
+            action: Some("delete".to_string()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            summary_format: SummaryFormat::Text,
+            fail_on_error: false,
+        };
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok(), "delete run should succeed: {result:?}");
+        assert!(link_a.exists(), "first hardlink must survive");
+        assert!(link_b.exists(), "second hardlink must survive");
+    }
+
+    /// Mixed group shape `{F, F-alias, G}`: a physical file `F` reachable through
+    /// two scanned roots as an alias pair (here via a hardlink so the property
+    /// holds without `--follow-symlinks`), PLUS a genuinely distinct file `G`
+    /// with identical content on a third root. `F`'s earliest occurrence is
+    /// root0. After `--action delete --force`:
+    ///   * the earliest-listed copy of `F` (root0) survives,
+    ///   * `G`'s redundant copy IS acted on (one real duplicate handled),
+    ///   * no alias of `F` is destroyed.
+    /// This pins survivor preservation when an alias and a true duplicate coexist.
+    #[test]
+    #[cfg(unix)]
+    fn test_mixed_alias_and_real_duplicate_survivor_preserved() {
+        let _guard = lock_progress();
+        set_progress_env();
+
+        let temp = TempDir::new().expect("temp dir");
+        // Three sibling roots so root ordering is deterministic.
+        let root0 = temp.path().join("root0");
+        let root1 = temp.path().join("root1");
+        let root2 = temp.path().join("root2");
+        fs::create_dir(&root0).expect("create root0");
+        fs::create_dir(&root1).expect("create root1");
+        fs::create_dir(&root2).expect("create root2");
+
+        // F: one physical file, hardlinked across root0 (earliest) and root1.
+        let f_primary = root0.join("f.txt");
+        let f_alias = root1.join("f.txt");
+        fs::write(&f_primary, b"shared content").expect("write f_primary");
+        fs::hard_link(&f_primary, &f_alias).expect("hardlink f_alias");
+
+        // G: a genuinely distinct file on root2 with identical content — a real
+        // duplicate of F that must be acted on.
+        let g = root2.join("g.txt");
+        fs::write(&g, b"shared content").expect("write g");
+
+        let args = Args {
+            directories: vec![root0.clone(), root1.clone(), root2.clone()],
+            action: Some("delete".to_string()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            summary_format: SummaryFormat::Text,
+            fail_on_error: false,
+        };
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok(), "delete run should succeed: {result:?}");
+
+        // Identity collapse leaves {F (root0), G (root2)} as the real group;
+        // F is the survivor (lowest root_index), G's copy is deleted.
+        assert!(
+            f_primary.exists(),
+            "earliest copy of F (root0) must survive as the group survivor"
+        );
+        assert!(
+            f_alias.exists(),
+            "no alias of F may be destroyed (hardlink collapsed before action)"
+        );
+        assert!(
+            !g.exists(),
+            "G is a genuine duplicate of F and must be deleted"
+        );
+    }
+
     // ==================== Stage 2: Error Path Tests ====================
 
     #[test]
@@ -3001,7 +3342,7 @@ mod tests {
         fs::write(&dest_file, b"I am a file not a directory").expect("create file as dest");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(dest_file),
             force: true,
@@ -3035,7 +3376,7 @@ mod tests {
         let nonexistent = temp.path().join("does_not_exist");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(nonexistent),
             force: true,
@@ -3064,7 +3405,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".into()),
             dest: None,
             force: true,
@@ -3094,7 +3435,7 @@ mod tests {
         let summary_file = temp.path().join("output").join("summary.json");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None,
             dest: None,
             force: true,
@@ -3125,7 +3466,7 @@ mod tests {
         let summary_file = temp.path().join("summary.txt");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None,
             dest: None,
             force: true,
@@ -3176,7 +3517,7 @@ mod tests {
         env::set_var("MDD_TRASH_DIR", &trash_path);
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("trash".into()),
             dest: None,
             force: true,
@@ -3247,7 +3588,7 @@ mod tests {
         fs::write(dir.join("file.txt"), b"data").expect("write file");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".into()),
             dest: None,
             force: true,
@@ -3297,7 +3638,7 @@ mod tests {
         }
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(dest_path.to_path_buf()),
             force: true,
@@ -3324,11 +3665,11 @@ mod tests {
         let dest_dir = temp.path().join("dest");
         fs::create_dir(&dest_dir).expect("create dest");
 
-        let mut duplicates: HashMap<String, Vec<(PathBuf, u64)>> = HashMap::new();
+        let mut duplicates: HashMap<String, Vec<(PathBuf, u64, usize)>> = HashMap::new();
         // Add a group with only one file - should be skipped
         duplicates.insert(
             "single_hash".into(),
-            vec![(temp.path().join("single.txt"), 5)],
+            vec![(temp.path().join("single.txt"), 5, 0)],
         );
         // Add a normal duplicate group
         let file1 = temp.path().join("dup1.txt");
@@ -3337,7 +3678,7 @@ mod tests {
         fs::write(&file2, b"dup").expect("write dup2");
         duplicates.insert(
             "dup_hash".into(),
-            vec![(file1.clone(), 3), (file2.clone(), 3)],
+            vec![(file1.clone(), 3, 0), (file2.clone(), 3, 0)],
         );
 
         let report = process_duplicates(
@@ -3441,7 +3782,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".into()),
             dest: None,
             force: true,
@@ -3470,7 +3811,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".into()),
             dest: None,
             force: true,
@@ -3499,7 +3840,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".into()),
             dest: None,
             force: true,
@@ -3542,8 +3883,7 @@ mod tests {
 
         // Scan WITH follow_symlinks
         let (_, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, true)
-                .expect("scan with follow_symlinks");
+            scan_one(dir, false, false, true).expect("scan with follow_symlinks");
 
         assert_eq!(scanned, 3);
         assert_eq!(dup_count, 2);
@@ -3559,7 +3899,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None, // No action = read-only
             dest: None,
             force: true,
@@ -3590,7 +3930,7 @@ mod tests {
         fs::write(dir.join("file1.txt"), b"unique").expect("write file1");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None,
             dest: None,
             force: true,
@@ -3629,7 +3969,7 @@ mod tests {
         let dest = readonly_parent.join("newdir");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(dest),
             force: true,
@@ -3707,7 +4047,10 @@ mod tests {
         let hash = hash_file(&file1).expect("hash");
         let size = fs::metadata(&file1).unwrap().len();
         let mut duplicates = HashMap::new();
-        duplicates.insert(hash, vec![(file1.clone(), size), (file2.clone(), size)]);
+        duplicates.insert(
+            hash,
+            vec![(file1.clone(), size, 0), (file2.clone(), size, 0)],
+        );
 
         let report = process_duplicates(
             &duplicates,
@@ -3733,8 +4076,7 @@ mod tests {
         fs::write(dir.join("b2.txt"), b"group_b").expect("write");
         fs::write(dir.join("unique.txt"), b"unique_content").expect("write");
 
-        let (dups, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
+        let (dups, scanned, dup_count, _, _) = scan_one(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 5);
         assert_eq!(dups.len(), 2); // Two duplicate groups
@@ -3751,7 +4093,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".into()),
             dest: None,
             force: false, // Requires confirmation
@@ -3803,8 +4145,7 @@ mod tests {
         fs::create_dir(&empty_dir).expect("create empty dir");
 
         let (dups, scanned, dup_count, wasted, _) =
-            find_duplicates_optimized_with_options(&empty_dir, false, false, false)
-                .expect("scan empty");
+            scan_one(&empty_dir, false, false, false).expect("scan empty");
 
         assert_eq!(scanned, 0);
         assert_eq!(dup_count, 0);
@@ -3821,7 +4162,7 @@ mod tests {
         fs::write(dir.join("only_file.txt"), b"unique").expect("write");
 
         let (dups, scanned, dup_count, wasted, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
+            scan_one(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 1);
         assert_eq!(dup_count, 0);
@@ -3840,8 +4181,7 @@ mod tests {
         fs::write(dir.join("file1.txt"), b"aaaa").expect("write");
         fs::write(dir.join("file2.txt"), b"bbbb").expect("write");
 
-        let (dups, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
+        let (dups, scanned, dup_count, _, _) = scan_one(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 2);
         assert_eq!(dup_count, 0); // No duplicates - different content
@@ -3862,7 +4202,7 @@ mod tests {
         fs::write(dir.join("a/b/c/level3.txt"), b"dup").expect("write level3");
 
         let (_, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan nested");
+            scan_one(dir, false, false, false).expect("scan nested");
 
         assert_eq!(scanned, 4);
         assert_eq!(dup_count, 3); // 4 files, 1 original + 3 duplicates
@@ -3880,7 +4220,7 @@ mod tests {
         let dest = TempDir::new().expect("dest dir");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(dest.path().to_path_buf()),
             force: true,
@@ -3911,7 +4251,7 @@ mod tests {
         let summary_path = temp.path().join("summary.json");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".into()),
             dest: None,
             force: true,
@@ -3971,8 +4311,7 @@ mod tests {
 
         // Scan with follow_symlinks=true (even though no symlinks exist)
         let (_, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, true)
-                .expect("scan with follow_symlinks");
+            scan_one(dir, false, false, true).expect("scan with follow_symlinks");
 
         assert_eq!(scanned, 2);
         assert_eq!(dup_count, 1);
@@ -3992,7 +4331,7 @@ mod tests {
         env::set_var("MDD_TRASH_DIR", &trash_path);
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("trash".into()),
             dest: None,
             force: true,
@@ -4025,7 +4364,7 @@ mod tests {
         let dest = TempDir::new().expect("dest dir");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(dest.path().to_path_buf()),
             force: true,
@@ -4054,7 +4393,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".into()),
             dest: None,
             force: true,
@@ -4104,7 +4443,7 @@ mod tests {
         }
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(dest_path.to_path_buf()),
             force: true,
@@ -4135,8 +4474,7 @@ mod tests {
         fs::write(dir.join("copy2.txt"), b"same content").expect("write 2");
         fs::write(dir.join("copy3.txt"), b"same content").expect("write 3");
 
-        let (dups, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
+        let (dups, scanned, dup_count, _, _) = scan_one(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 3);
         assert_eq!(dups.len(), 1); // One duplicate group
@@ -4155,7 +4493,7 @@ mod tests {
         fs::write(dir.join("copy3.txt"), b"same").expect("write 3");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("delete".into()),
             dest: None,
             force: true,
@@ -4193,7 +4531,7 @@ mod tests {
         let summary_path = temp.path().join("readonly_summary.json");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None, // No action
             dest: None,
             force: true,
@@ -4230,7 +4568,7 @@ mod tests {
         assert!(!dest.exists());
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(dest.clone()),
             force: true,
@@ -4264,11 +4602,14 @@ mod tests {
         let hash = hash_file(&valid_file).expect("hash");
         let size = 7u64;
 
-        let mut duplicates: HashMap<String, Vec<(PathBuf, u64)>> = HashMap::new();
+        let mut duplicates: HashMap<String, Vec<(PathBuf, u64, usize)>> = HashMap::new();
         // Add valid file and an invalid path that is guaranteed to sort after the valid file so it
         // will be processed (the first sorted entry is kept).
         let invalid_path = valid_file.join("..");
-        duplicates.insert(hash, vec![(valid_file.clone(), size), (invalid_path, size)]);
+        duplicates.insert(
+            hash,
+            vec![(valid_file.clone(), size, 0), (invalid_path, size, 0)],
+        );
 
         let report = process_duplicates(
             &duplicates,
@@ -4294,7 +4635,7 @@ mod tests {
         env::set_var("MDD_TRASH_DIR", &trash_path);
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("trash".into()), // Trash action, not move
             dest: None,
             force: true,
@@ -4327,7 +4668,7 @@ mod tests {
         let dest = TempDir::new().expect("dest dir");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("move".into()),
             dest: Some(dest.path().to_path_buf()),
             force: true,
@@ -4360,7 +4701,7 @@ mod tests {
         env::set_var("MDD_TRASH_DIR", &trash_path);
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: Some("trash".into()),
             dest: None,
             force: true,
@@ -4405,8 +4746,7 @@ mod tests {
             fs::write(dir.join(format!("file{}.txt", i)), b"duplicate").expect("write");
         }
 
-        let (dups, scanned, dup_count, _, _) =
-            find_duplicates_optimized_with_options(dir, false, false, false).expect("scan");
+        let (dups, scanned, dup_count, _, _) = scan_one(dir, false, false, false).expect("scan");
 
         assert_eq!(scanned, 10);
         assert_eq!(dups.len(), 1);
@@ -4423,7 +4763,7 @@ mod tests {
         fs::write(dir.join("file2.txt"), b"dup").expect("write file2");
 
         let args = Args {
-            directory: dir.to_path_buf(),
+            directories: vec![dir.to_path_buf()],
             action: None,
             dest: None,
             force: true,
@@ -4455,7 +4795,10 @@ mod tests {
         let hash = hash_file(&file1).expect("hash");
         let size = fs::metadata(&file1).unwrap().len();
         let mut duplicates = HashMap::new();
-        duplicates.insert(hash, vec![(file1.clone(), size), (file2.clone(), size)]);
+        duplicates.insert(
+            hash,
+            vec![(file1.clone(), size, 0), (file2.clone(), size, 0)],
+        );
 
         let report = process_duplicates(
             &duplicates,
@@ -4482,7 +4825,10 @@ mod tests {
         let hash = hash_file(&file1).expect("hash");
         let size = fs::metadata(&file1).unwrap().len();
         let mut duplicates = HashMap::new();
-        duplicates.insert(hash, vec![(file1.clone(), size), (file2.clone(), size)]);
+        duplicates.insert(
+            hash,
+            vec![(file1.clone(), size, 0), (file2.clone(), size, 0)],
+        );
 
         let report = process_duplicates(
             &duplicates,
@@ -4552,6 +4898,21 @@ mod tests {
         let (msg, code) = result.unwrap();
         assert!(msg.contains("--create-dest"));
         assert!(msg.contains("--action move"));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_overlapping_paths() {
+        let outer = PathBuf::from("/some/outer");
+        let inner = PathBuf::from("/some/outer/inner");
+        let err = AppError::OverlappingPaths(outer.clone(), inner.clone());
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("is inside"));
+        assert!(msg.contains("non-overlapping paths"));
+        assert!(msg.contains(&inner.display().to_string()));
+        assert!(msg.contains(&outer.display().to_string()));
         assert_eq!(code, 1);
     }
 
@@ -4670,11 +5031,19 @@ mod tests {
             symlink(&target, &link).expect("create symlink");
 
             // Scan with follow_symlinks=true
-            let (_, scanned, _, _, _) =
-                find_duplicates_optimized_with_options(dir, false, false, true).expect("scan");
+            let (_, scanned, duplicate_count, _, _) =
+                scan_one(dir, false, false, true).expect("scan");
 
             // Should scan both target and link
             assert_eq!(scanned, 2);
+            // The symlinked view of a file is the SAME physical file, not a
+            // duplicate of it: the identity collapse must drop the pair so no
+            // duplicate is reported. Pins the self-duplicate fix against
+            // regression.
+            assert_eq!(
+                duplicate_count, 0,
+                "a symlink to a file is not a duplicate of that file"
+            );
         }
     }
 
@@ -4734,7 +5103,7 @@ mod tests {
                 // Drop handle first so icacls works better?
                 drop(handle);
 
-                let result = find_duplicates_optimized_with_options(dir, false, false, false)
+                let result = scan_one(dir, false, false, false)
                     .expect("scan should succeed even with hash error");
 
                 // file2 hashing should fail, so it shouldn't be in duplicates.
@@ -4760,8 +5129,7 @@ mod tests {
             fs::set_permissions(&unreadable, perms).expect("set perms");
 
             let (_, scanned, _, _, _) =
-                find_duplicates_optimized_with_options(dir, false, false, false)
-                    .expect("scan handles unreadable dir");
+                scan_one(dir, false, false, false).expect("scan handles unreadable dir");
 
             // Should not crash.
             assert_eq!(scanned, 0);
@@ -4771,5 +5139,624 @@ mod tests {
             perms.set_mode(0o755);
             fs::set_permissions(&unreadable, perms).expect("restore");
         }
+    }
+
+    // ==================== Stage A: Multi-Path Scanning ====================
+
+    #[test]
+    fn test_cross_path_consolidation_keeps_first_dir() {
+        let _guard = lock_progress();
+        set_progress_env();
+        // Create two sibling directories under one parent with controlled names
+        // so the survivor choice is provably driven by root_index (listing order)
+        // rather than alphabetical luck of random temp paths. The first-listed
+        // directory ("zzz") sorts AFTER the second ("aaa"), so a path-only sort
+        // would keep the wrong copy; only a (root_index, path) sort keeps zzz.
+        let parent = TempDir::new().expect("temp parent");
+        let dir_first = parent.path().join("zzz");
+        let dir_second = parent.path().join("aaa");
+        fs::create_dir(&dir_first).expect("create zzz");
+        fs::create_dir(&dir_second).expect("create aaa");
+        let file_first = dir_first.join("copy.txt");
+        let file_second = dir_second.join("copy.txt");
+        fs::write(&file_first, b"shared content").expect("write first");
+        fs::write(&file_second, b"shared content").expect("write second");
+
+        let args = Args {
+            directories: vec![dir_first.clone(), dir_second.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        // root_index dominates path order: the copy under the first-listed
+        // directory (zzz) survives even though its path sorts after aaa.
+        assert!(
+            file_first.exists(),
+            "survivor should be in the first-listed directory"
+        );
+        assert!(
+            !file_second.exists(),
+            "duplicate in second-listed directory removed"
+        );
+    }
+
+    #[test]
+    fn test_first_path_priority_beats_alphabetical() {
+        let _guard = lock_progress();
+        set_progress_env();
+        // Create two sibling directories whose names sort A < B, then pass them
+        // in order [B, A] so the alphabetically-later directory is listed first.
+        let parent = TempDir::new().expect("temp parent");
+        let dir_a = parent.path().join("aaa");
+        let dir_b = parent.path().join("bbb");
+        fs::create_dir(&dir_a).expect("create aaa");
+        fs::create_dir(&dir_b).expect("create bbb");
+        let file_a = dir_a.join("copy.txt");
+        let file_b = dir_b.join("copy.txt");
+        fs::write(&file_a, b"shared content").expect("write a");
+        fs::write(&file_b, b"shared content").expect("write b");
+
+        let args = Args {
+            directories: vec![dir_b.clone(), dir_a.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        // root_index dominates path order: the copy under the first-listed
+        // directory (bbb) survives even though its path sorts after aaa.
+        assert!(file_b.exists(), "survivor should be under first-listed dir");
+        assert!(!file_a.exists(), "duplicate under later dir removed");
+    }
+
+    #[test]
+    fn test_within_later_path_consolidation() {
+        let _guard = lock_progress();
+        set_progress_env();
+        // A three-member group spanning both directories: a within-directory pair
+        // under dir_a plus one twin under dir_b. The first-listed directory (dir_a)
+        // owns two copies and dir_b owns one. We name the dirs so dir_a sorts AFTER
+        // dir_b, then list dir_a first, so a path-only sort would pick dir_b's copy
+        // as survivor; only a (root_index, path) sort keeps a copy under dir_a.
+        let parent = TempDir::new().expect("temp parent");
+        let dir_a = parent.path().join("yyy");
+        let dir_b = parent.path().join("bbb");
+        fs::create_dir(&dir_a).expect("create yyy");
+        fs::create_dir(&dir_b).expect("create bbb");
+        let file_a1 = dir_a.join("a1.txt");
+        let file_a2 = dir_a.join("a2.txt");
+        let file_b = dir_b.join("b.txt");
+        fs::write(&file_a1, b"shared content").expect("write a1");
+        fs::write(&file_a2, b"shared content").expect("write a2");
+        fs::write(&file_b, b"shared content").expect("write b");
+
+        let args = Args {
+            directories: vec![dir_a.clone(), dir_b.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        // Survivor is chosen by root_index (first-listed dir_a), then alphabetical
+        // path within that dir (a1 before a2). The dir_b copy is removed even
+        // though dir_b sorts before dir_a alphabetically.
+        assert!(
+            file_a1.exists(),
+            "survivor a1 should remain (first dir, first path)"
+        );
+        assert!(
+            !file_a2.exists(),
+            "duplicate a2 in first dir should be removed"
+        );
+        assert!(
+            !file_b.exists(),
+            "cross-dir duplicate b should be removed by root_index"
+        );
+    }
+
+    #[test]
+    fn test_group_entirely_on_later_path_consolidates() {
+        let _guard = lock_progress();
+        set_progress_env();
+        // HLD §7 test 3 (literal form): a duplicate set living ONLY under the
+        // second listed path. The first path holds an unrelated, unique file and
+        // none of the duplicate set's members. The group must still collapse to a
+        // single survivor under the second path, and a delete action must remove
+        // exactly one of the two copies there.
+        let parent = TempDir::new().expect("temp parent");
+        let p1 = parent.path().join("p1");
+        let p2 = parent.path().join("p2");
+        fs::create_dir(&p1).expect("create p1");
+        fs::create_dir(&p2).expect("create p2");
+        // p1 holds only a unique file (not part of the duplicate set).
+        let unique = p1.join("unique.txt");
+        fs::write(&unique, b"unique content not duplicated").expect("write unique");
+        // Both members of the duplicate set live exclusively under p2.
+        let file_b1 = p2.join("b1.txt");
+        let file_b2 = p2.join("b2.txt");
+        fs::write(&file_b1, b"shared content").expect("write b1");
+        fs::write(&file_b2, b"shared content").expect("write b2");
+
+        let args = Args {
+            directories: vec![p1.clone(), p2.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        // The group collapses to one survivor under p2 (b1 sorts before b2), and
+        // exactly one of the two copies remains. The unrelated unique file is
+        // untouched.
+        assert!(
+            file_b1.exists(),
+            "survivor b1 should remain (first path within p2)"
+        );
+        assert!(
+            !file_b2.exists(),
+            "duplicate b2 entirely on later path should be removed"
+        );
+        assert!(unique.exists(), "unrelated unique file must be untouched");
+    }
+
+    #[test]
+    fn test_survivor_is_earliest_listed_not_alphabetical() {
+        let _guard = lock_progress();
+        set_progress_env();
+        // The first-listed path holds NO copy of the duplicate set. The set spans
+        // two LATER paths whose alphabetical order disagrees with listing order:
+        // we name them `zzz` and `aaa` (so `aaa` < `zzz` alphabetically) but list
+        // `zzz` before `aaa`. The survivor must be the earliest *listed* path that
+        // holds a copy (`zzz`, lower root_index), NOT the alphabetically-first one
+        // (`aaa`). This fails if `survivor_cmp` is reduced to path-only ordering.
+        let parent = TempDir::new().expect("temp parent");
+        let empty_first = parent.path().join("empty_first");
+        let zzz = parent.path().join("zzz");
+        let aaa = parent.path().join("aaa");
+        fs::create_dir(&empty_first).expect("create empty_first");
+        fs::create_dir(&zzz).expect("create zzz");
+        fs::create_dir(&aaa).expect("create aaa");
+        // The duplicate set lives only on zzz and aaa.
+        let file_zzz = zzz.join("dup.txt");
+        let file_aaa = aaa.join("dup.txt");
+        fs::write(&file_zzz, b"shared content").expect("write zzz");
+        fs::write(&file_aaa, b"shared content").expect("write aaa");
+
+        let args = Args {
+            // empty_first is listed first (no copy), then zzz, then aaa.
+            directories: vec![empty_first.clone(), zzz.clone(), aaa.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        // Survivor is the earliest *listed* copy (zzz, root_index 1), even though
+        // aaa sorts first alphabetically. A path-only survivor_cmp would keep aaa.
+        assert!(
+            file_zzz.exists(),
+            "survivor should be the earliest-listed copy (zzz), not alphabetical"
+        );
+        assert!(
+            !file_aaa.exists(),
+            "alphabetically-first but later-listed copy (aaa) should be removed"
+        );
+    }
+
+    #[test]
+    fn test_detect_overlap_single_path_none() {
+        let temp = TempDir::new().expect("temp dir");
+        assert!(detect_overlap(&[temp.path().to_path_buf()]).is_none());
+    }
+
+    #[test]
+    fn test_detect_overlap_disjoint_none() {
+        let dir_a = TempDir::new().expect("temp a");
+        let dir_b = TempDir::new().expect("temp b");
+        assert!(
+            detect_overlap(&[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]).is_none()
+        );
+    }
+
+    #[test]
+    fn test_detect_overlap_nested_some() {
+        let parent = TempDir::new().expect("temp parent");
+        let child = parent.path().join("child");
+        fs::create_dir(&child).expect("create child");
+        let (outer, inner) = detect_overlap(&[parent.path().to_path_buf(), child.clone()])
+            .expect("expected overlap");
+        // Original (as-supplied) paths are returned, not canonicalized forms.
+        assert_eq!(outer, parent.path().to_path_buf());
+        assert_eq!(inner, child);
+    }
+
+    #[test]
+    fn test_detect_overlap_equal_some() {
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path().to_path_buf();
+        let (outer, inner) =
+            detect_overlap(&[dir.clone(), dir.clone()]).expect("equal paths must overlap");
+        assert_eq!(outer, dir);
+        assert_eq!(inner, dir);
+    }
+
+    #[test]
+    fn test_detect_overlap_shared_prefix_siblings_none() {
+        // Siblings whose names share a string prefix (`foo` vs `foobar`) must NOT
+        // be treated as overlapping. This pins the use of component-based
+        // `Path::starts_with`; a regression to string-based prefix matching would
+        // wrongly flag these as nested and this test would fail.
+        let parent = TempDir::new().expect("temp parent");
+        let foo = parent.path().join("foo");
+        let foobar = parent.path().join("foobar");
+        fs::create_dir(&foo).expect("create foo");
+        fs::create_dir(&foobar).expect("create foobar");
+        // Both orderings must be disjoint regardless of which is listed first.
+        assert!(detect_overlap(&[foo.clone(), foobar.clone()]).is_none());
+        assert!(detect_overlap(&[foobar, foo]).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_detect_overlap_symlink_aliased_root_some() {
+        // A real directory and a symlink pointing at it are lexically distinct
+        // paths but alias the same physical location. Canonicalization must
+        // collapse them so the overlap is detected. Dropping `fs::canonicalize`
+        // in `detect_overlap` makes this assertion fail.
+        let temp = TempDir::new().expect("temp dir");
+        let real = temp.path().join("real");
+        let real_sub = real.join("sub");
+        fs::create_dir_all(&real_sub).expect("create real/sub");
+        let link = temp.path().join("link");
+        symlink(&real, &link).expect("create symlink link -> real");
+
+        // Equal-after-resolution case: real and link resolve to the same dir.
+        assert!(
+            detect_overlap(&[real.clone(), link.clone()]).is_some(),
+            "real and its symlink alias must overlap"
+        );
+
+        // Nested-after-resolution case: link/sub resolves inside real.
+        let link_sub = link.join("sub");
+        assert!(
+            detect_overlap(&[real, link_sub]).is_some(),
+            "real and a subdir reached through the symlink must overlap"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_detect_overlap_junction_aliased_root_some() {
+        // A directory junction (created without admin/developer mode) aliases a
+        // target directory under a different path. Canonicalization must resolve
+        // the junction to its target so the overlap is detected. Dropping
+        // `fs::canonicalize` in `detect_overlap` makes this assertion fail.
+        let temp = TempDir::new().expect("temp dir");
+        let target = temp.path().join("target");
+        fs::create_dir(&target).expect("create target");
+        let junction = temp.path().join("junction");
+
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status();
+
+        // Skip gracefully if junction creation is unavailable in this
+        // environment rather than producing a false failure.
+        match status {
+            Ok(s) if s.success() && junction.exists() => {}
+            _ => return,
+        }
+
+        assert!(
+            detect_overlap(&[target, junction]).is_some(),
+            "target and its directory junction must overlap"
+        );
+    }
+
+    #[test]
+    fn test_run_app_rejects_nested_paths_without_modifying_disk() {
+        let _guard = lock_progress();
+        set_progress_env();
+        // Parent dir holds a duplicate that WOULD be deleted under --action delete
+        // --force; a child subdir is passed alongside the parent. The overlap check
+        // must reject the run before any destructive work, leaving both files intact.
+        let parent = TempDir::new().expect("temp parent");
+        let child = parent.path().join("child");
+        fs::create_dir(&child).expect("create child");
+        let file1 = parent.path().join("file1.txt");
+        let file2 = parent.path().join("file2.txt");
+        fs::write(&file1, b"duplicate").expect("write file1");
+        fs::write(&file2, b"duplicate").expect("write file2");
+
+        let args = Args {
+            directories: vec![parent.path().to_path_buf(), child.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(
+            matches!(result, Err(AppError::OverlappingPaths(_, _))),
+            "nested paths should be rejected, got: {:?}",
+            result
+        );
+        assert!(file1.exists(), "file1 must remain untouched");
+        assert!(file2.exists(), "file2 must remain untouched");
+    }
+
+    #[test]
+    fn test_run_app_rejects_same_path_twice() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path().to_path_buf();
+        fs::write(dir.join("file1.txt"), b"duplicate").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"duplicate").expect("write file2");
+
+        let args = Args {
+            directories: vec![dir.clone(), dir.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(
+            matches!(result, Err(AppError::OverlappingPaths(_, _))),
+            "the same directory passed twice must be rejected, got: {:?}",
+            result
+        );
+        assert!(
+            dir.join("file1.txt").exists(),
+            "file1 must remain untouched"
+        );
+        assert!(
+            dir.join("file2.txt").exists(),
+            "file2 must remain untouched"
+        );
+    }
+
+    #[test]
+    fn test_run_app_disjoint_paths_not_rejected() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let dir_a = TempDir::new().expect("temp a");
+        let dir_b = TempDir::new().expect("temp b");
+        fs::write(dir_a.path().join("a.txt"), b"content").expect("write a");
+        fs::write(dir_b.path().join("b.txt"), b"content").expect("write b");
+
+        let args = Args {
+            directories: vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+            action: None,
+            dest: None,
+            force: false,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(
+            result.is_ok(),
+            "disjoint paths should scan normally, got: {:?}",
+            result
+        );
+    }
+
+    // ==================== Stage C: Identity Safety Net & Cross-Device ====================
+
+    #[test]
+    #[cfg(unix)]
+    fn test_identity_safety_net_does_not_delete_aliased_file() {
+        // A single physical file reachable twice within the scanned tree (the real
+        // file plus a symlinked view of itself under --follow-symlinks) must NOT be
+        // reported as a duplicate of itself, and must NOT be deleted. Without the
+        // identity collapse, the symlink-followed view and the real file share a
+        // hash and form a bogus duplicate pair; the survivor selection would then
+        // act on one of them and destroy the only physical copy.
+        let _guard = lock_progress();
+        set_progress_env();
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let real = dir.join("real.txt");
+        fs::write(&real, b"the only copy").expect("write real file");
+        // A symlink in the same tree makes the same physical file reachable a
+        // second time when symlinks are followed.
+        let link = dir.join("alias.txt");
+        symlink(&real, &link).expect("create symlink alias");
+
+        // Read-only scan first: the duplicate count must not be inflated.
+        let (dups, _, dup_count, wasted, _) =
+            scan_one(dir, false, false, true).expect("scan with follow-symlinks");
+        assert_eq!(
+            dup_count, 0,
+            "an aliased physical file must not count as its own duplicate"
+        );
+        assert_eq!(wasted, 0, "no wasted space for a single physical file");
+        assert!(
+            dups.is_empty(),
+            "no duplicate groups should survive the identity collapse"
+        );
+
+        // Now drive a destructive action: the real file must survive.
+        let args = Args {
+            directories: vec![dir.to_path_buf()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: true,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok(), "scan should succeed, got: {:?}", result);
+        assert!(
+            real.exists(),
+            "the only physical copy must not be deleted via its symlink alias"
+        );
+        assert_eq!(
+            fs::read(&real).expect("read survivor"),
+            b"the only copy",
+            "survivor content must be intact"
+        );
+    }
+
+    #[test]
+    fn test_cross_device_move_falls_back_to_copy() {
+        // A real multi-path duplicate scenario driven through --action move --dest,
+        // with the first rename forced to fail with EXDEV so the relocate_file
+        // copy-fallback (now the common path for cross-drive moves) is exercised.
+        let _guard = lock_progress();
+        set_progress_env();
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+
+        let parent = TempDir::new().expect("temp parent");
+        let dir_a = parent.path().join("aaa");
+        let dir_b = parent.path().join("bbb");
+        fs::create_dir(&dir_a).expect("create aaa");
+        fs::create_dir(&dir_b).expect("create bbb");
+        let file_a = dir_a.join("copy.txt");
+        let file_b = dir_b.join("copy.txt");
+        fs::write(&file_a, b"cross device payload").expect("write a");
+        fs::write(&file_b, b"cross device payload").expect("write b");
+
+        let dest_dir = TempDir::new().expect("dest dir");
+        let dest_path = dest_dir.path().to_path_buf();
+
+        #[cfg(unix)]
+        let cross_device_err = 18;
+        #[cfg(windows)]
+        let cross_device_err = 17;
+        // The single non-survivor (under dir_b) triggers exactly one relocate; its
+        // rename fails cross-device and must fall back to copy+delete.
+        test_support::enqueue_rename_result(Err(io::Error::from_raw_os_error(cross_device_err)));
+
+        let args = Args {
+            directories: vec![dir_a.clone(), dir_b.clone()],
+            action: Some("move".into()),
+            dest: Some(dest_path.clone()),
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(
+            result.is_ok(),
+            "cross-device move should succeed via copy fallback, got: {:?}",
+            result
+        );
+        // Survivor (first-listed dir) stays put; duplicate is relocated via copy.
+        assert!(file_a.exists(), "survivor under first dir should remain");
+        assert!(
+            !file_b.exists(),
+            "duplicate under second dir should be moved away"
+        );
+        let moved: Vec<_> = fs::read_dir(&dest_path)
+            .expect("read dest")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect dest entries");
+        assert_eq!(moved.len(), 1, "exactly one file relocated to destination");
+        assert_eq!(
+            fs::read(moved[0].path()).expect("read moved file"),
+            b"cross device payload",
+            "relocated content must match"
+        );
     }
 }

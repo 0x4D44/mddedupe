@@ -24,8 +24,10 @@ cargo build --release
 # Run all tests (unit + integration)
 cargo test
 
-# Run only unit tests in main.rs
-cargo test --lib
+# Run only the binary's unit tests (in main.rs)
+# NOTE: this is a binary-only crate with no lib target, so `cargo test --lib`
+# errors. Use `cargo test --bin mddedupe` instead.
+cargo test --bin mddedupe
 
 # Run only integration tests
 cargo test --test cli
@@ -54,12 +56,26 @@ cargo fmt --check
 # Run in development mode
 cargo run -- /path/to/directory
 
+# Scan two or more directories at once (duplicates are found ACROSS them; the
+# survivor is kept under the earliest-listed path)
+cargo run -- /path/to/first /path/to/second
+
 # Run with debug logging
 RUST_LOG=debug cargo run -- /path/to/directory
 
 # Disable progress indicators during development
 MDDEDUPE_SCAN_PROGRESS_MS=0 MDDEDUPE_HASH_PROGRESS_MS=0 cargo run -- /path/to/directory
 ```
+
+### `--follow-symlinks` with multiple roots (caveat)
+
+`--follow-symlinks` across more than one supplied root is **unsupported** for
+*count* accuracy. The identity safety net (collapse by `FileId`) guarantees
+**safety** — the last physical copy is never deleted even when reachable through
+multiple paths — but symlinks that cross between roots create ambiguous ownership
+and visit-ordering, and duplicate *counts* in those pathological cross-root
+setups are not guaranteed. Overlapping roots are rejected outright; non-overlapping
+roots joined by cross-root symlinks are allowed but their counts are best-effort.
 
 ## Code Architecture
 

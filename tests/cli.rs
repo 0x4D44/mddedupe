@@ -234,6 +234,43 @@ fn cli_log_level_warn_suppresses_info_logs() {
     assert!(!stdout.contains("Duplicate group"));
 }
 
+#[test]
+fn cli_multi_path_startup_line_lists_all_dirs() {
+    let dir_a = assert_fs::TempDir::new().expect("create dir a");
+    let dir_b = assert_fs::TempDir::new().expect("create dir b");
+    dir_a.child("a.txt").write_str("content").expect("write a");
+    dir_b.child("b.txt").write_str("content").expect("write b");
+
+    let output = cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            dir_a.path().to_str().unwrap(),
+            dir_b.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("stdout should be valid UTF-8");
+    let start_line = stdout
+        .lines()
+        .find(|line| line.starts_with("Starting duplicate scan in:"))
+        .expect("startup line should be present");
+    assert!(
+        start_line.contains(dir_a.path().to_str().unwrap()),
+        "startup line should list first dir, got: {}",
+        start_line
+    );
+    assert!(
+        start_line.contains(dir_b.path().to_str().unwrap()),
+        "startup line should list second dir, got: {}",
+        start_line
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_log_level_none_reports_failures() {
@@ -273,6 +310,241 @@ fn cli_log_level_none_reports_failures() {
         "expected failure summary in stderr, got: {}",
         stderr
     );
+}
+
+#[test]
+fn cli_read_only_lists_survivor_first() {
+    // Two sibling dirs under one parent with controlled names so the choice is
+    // provably driven by listing order (root_index), not alphabetical luck of
+    // random temp paths. The first-LISTED dir ("zzz_dir") sorts AFTER the
+    // second ("aaa_dir"); a path-only sort would list aaa first, but the
+    // (root_index, path) survivor sort must list the zzz copy first.
+    let parent = assert_fs::TempDir::new().expect("create parent");
+    let dir_zzz = parent.child("zzz_dir");
+    let dir_aaa = parent.child("aaa_dir");
+    dir_zzz.create_dir_all().expect("create zzz_dir");
+    dir_aaa.create_dir_all().expect("create aaa_dir");
+    dir_zzz
+        .child("copy.txt")
+        .write_str("shared content")
+        .expect("write zzz copy");
+    dir_aaa
+        .child("copy.txt")
+        .write_str("shared content")
+        .expect("write aaa copy");
+
+    let output = cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            dir_zzz.path().to_str().unwrap(),
+            dir_aaa.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("stdout should be valid UTF-8");
+
+    // Restrict the search to the duplicate-group listing block. The startup
+    // line ("Starting duplicate scan in:") echoes the supplied dirs in order
+    // and would otherwise mask the group's ordering, so we slice from the
+    // "Duplicate group" header onward.
+    let group_start = stdout
+        .find("Duplicate group")
+        .expect("read-only listing should print a duplicate group");
+    let group_block = &stdout[group_start..];
+
+    let zzz_marker = dir_zzz.path().to_str().unwrap();
+    let aaa_marker = dir_aaa.path().to_str().unwrap();
+    let zzz_pos = group_block
+        .find(zzz_marker)
+        .expect("zzz_dir copy should appear in the duplicate-group block");
+    let aaa_pos = group_block
+        .find(aaa_marker)
+        .expect("aaa_dir copy should appear in the duplicate-group block");
+    assert!(
+        zzz_pos < aaa_pos,
+        "survivor under first-listed dir (zzz_dir) should be listed before \
+         the aaa_dir copy; zzz at {} aaa at {}, group block:\n{}",
+        zzz_pos,
+        aaa_pos,
+        group_block
+    );
+}
+
+#[test]
+fn cli_json_summary_directories_match_order() {
+    let dir_a = assert_fs::TempDir::new().expect("create dir a");
+    let dir_b = assert_fs::TempDir::new().expect("create dir b");
+    dir_a.child("a.txt").write_str("content").expect("write a");
+    dir_b.child("b.txt").write_str("content").expect("write b");
+
+    let assert = cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            "--summary-format",
+            "json",
+            "--quiet",
+            dir_a.path().to_str().unwrap(),
+            dir_b.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone())
+        .expect("stdout should be valid UTF-8");
+    let json_start = output
+        .find('{')
+        .expect("JSON output should contain an object");
+    let summary: Value =
+        serde_json::from_str(&output[json_start..]).expect("expected JSON summary output");
+
+    let directories = summary["directories"]
+        .as_array()
+        .expect("directories should be a JSON array");
+    assert_eq!(
+        directories.len(),
+        2,
+        "directories array should contain both supplied paths, got: {:?}",
+        directories
+    );
+
+    let expected_a = std::path::Path::new(dir_a.path().to_str().unwrap())
+        .display()
+        .to_string();
+    let expected_b = std::path::Path::new(dir_b.path().to_str().unwrap())
+        .display()
+        .to_string();
+    assert_eq!(
+        directories[0].as_str().unwrap(),
+        expected_a,
+        "first directory entry should match first supplied path in order"
+    );
+    assert_eq!(
+        directories[1].as_str().unwrap(),
+        expected_b,
+        "second directory entry should match second supplied path in order"
+    );
+}
+
+#[test]
+fn cli_nested_paths_rejected() {
+    // A parent directory and one of its subdirectories passed together must be
+    // rejected before any scan, with the overlap message on stderr.
+    let parent = assert_fs::TempDir::new().expect("create parent");
+    let child = parent.child("child");
+    child.create_dir_all().expect("create child");
+
+    cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            parent.path().to_str().unwrap(),
+            child.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("is inside"))
+        .stderr(predicates::str::contains("non-overlapping paths"));
+}
+
+#[test]
+fn cli_variadic_positional_parses_when_interleaved_with_options() {
+    // The `directories` positional is variadic (num_args = 1..). Verify clap
+    // parses it correctly in three interleaving shapes against options. Each run
+    // must succeed and scan exactly the directories supplied — confirmed via the
+    // "Starting duplicate scan in:" startup line which echoes all supplied paths.
+
+    // (a) single dir followed by options: `dir --action delete --force`
+    {
+        let temp = create_duplicate_fixture();
+        let dir = temp.path();
+        let duplicate = dir.join("file2.txt");
+        cargo_bin_cmd!("mddedupe")
+            .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+            .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+            .args([dir.to_str().unwrap(), "--action", "delete", "--force"])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains(dir.to_str().unwrap()));
+        assert!(
+            !duplicate.exists(),
+            "duplicate should be deleted in case (a)"
+        );
+    }
+
+    // (b) two dirs first, then options.
+    {
+        let dir_a = assert_fs::TempDir::new().expect("create dir a");
+        let dir_b = assert_fs::TempDir::new().expect("create dir b");
+        dir_a.child("a.txt").write_str("content").expect("write a");
+        dir_b.child("b.txt").write_str("content").expect("write b");
+
+        let output = cargo_bin_cmd!("mddedupe")
+            .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+            .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+            .args([
+                dir_a.path().to_str().unwrap(),
+                dir_b.path().to_str().unwrap(),
+                "--quiet",
+                "--log-level",
+                "none",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let stdout = String::from_utf8(output).expect("stdout should be valid UTF-8");
+        let start_line = stdout
+            .lines()
+            .find(|line| line.starts_with("Starting duplicate scan in:"))
+            .expect("startup line should be present in case (b)");
+        assert!(
+            start_line.contains(dir_a.path().to_str().unwrap())
+                && start_line.contains(dir_b.path().to_str().unwrap()),
+            "both dirs should be scanned in case (b), got: {}",
+            start_line
+        );
+    }
+
+    // (c) options before two dirs: `--quiet dir1 dir2`.
+    {
+        let dir_a = assert_fs::TempDir::new().expect("create dir a");
+        let dir_b = assert_fs::TempDir::new().expect("create dir b");
+        dir_a.child("a.txt").write_str("content").expect("write a");
+        dir_b.child("b.txt").write_str("content").expect("write b");
+
+        let output = cargo_bin_cmd!("mddedupe")
+            .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+            .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+            .args([
+                "--log-level",
+                "none",
+                dir_a.path().to_str().unwrap(),
+                dir_b.path().to_str().unwrap(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let stdout = String::from_utf8(output).expect("stdout should be valid UTF-8");
+        let start_line = stdout
+            .lines()
+            .find(|line| line.starts_with("Starting duplicate scan in:"))
+            .expect("startup line should be present in case (c)");
+        assert!(
+            start_line.contains(dir_a.path().to_str().unwrap())
+                && start_line.contains(dir_b.path().to_str().unwrap()),
+            "both dirs should be scanned in case (c), got: {}",
+            start_line
+        );
+    }
 }
 
 #[cfg(unix)]
