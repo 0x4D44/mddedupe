@@ -323,6 +323,41 @@ mod test_support {
     }
 }
 
+/// Detects whether any supplied path overlaps another (one is inside the other,
+/// or they are identical). Returns the first overlap found as `(outer, inner)`
+/// using the ORIGINAL (as-supplied) paths, or `None` if all paths are disjoint.
+///
+/// Comparison is done on best-effort canonicalized forms (`fs::canonicalize`,
+/// falling back to the raw path when canonicalization fails, e.g. the path does
+/// not exist yet). Canonicalizing both sides resolves symlinks and junctions, so
+/// roots that alias each other are caught, not just lexical nesting.
+fn detect_overlap(dirs: &[PathBuf]) -> Option<(PathBuf, PathBuf)> {
+    let canonical: Vec<PathBuf> = dirs
+        .iter()
+        // Canonicalize so symlink/junction aliases and case-insensitive Windows
+        // paths that resolve to the same physical root are caught. When a path
+        // does not exist, canonicalization fails and we fall back to the raw
+        // path; a nested overlap with such a nonexistent path may then be
+        // missed, but a nonexistent path contributes no files, so there is no
+        // data hazard.
+        .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()))
+        .collect();
+
+    for i in 0..dirs.len() {
+        for j in 0..dirs.len() {
+            if i == j {
+                continue;
+            }
+            // dirs[i] is the outer path if dirs[j]'s canonical form is nested
+            // inside (or equal to) dirs[i]'s canonical form.
+            if canonical[j].starts_with(&canonical[i]) {
+                return Some((dirs[i].clone(), dirs[j].clone()));
+            }
+        }
+    }
+    None
+}
+
 /// Computes the SHA‑256 hash of a file by reading it in chunks.
 /// Uses a 16‑KB buffer for improved I/O performance.
 fn hash_file(path: &Path) -> io::Result<String> {
@@ -918,6 +953,7 @@ enum AppError {
     Cancelled,
     UnknownAction(String),
     ActionFailures(usize),
+    OverlappingPaths(PathBuf, PathBuf),
 }
 
 impl From<io::Error> for AppError {
@@ -1037,6 +1073,13 @@ fn process_duplicates(
 fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
     install_ctrlc_handler()?;
     reset_cancellation_flag();
+
+    // Reject overlapping input paths before any filesystem scan or destructive
+    // work, so a physical file reachable through more than one supplied path can
+    // never reach the move/trash/delete path.
+    if let Some((outer, inner)) = detect_overlap(&args.directories) {
+        return Err(AppError::OverlappingPaths(outer, inner));
+    }
 
     let summary_stdout = args.summary_format == SummaryFormat::Text && !args.summary_silent;
     let log_output = !args.summary_only && !args.quiet && matches!(args.log_level, LogLevel::Info);
@@ -1354,6 +1397,14 @@ fn format_app_error(err: &AppError) -> Option<(String, i32)> {
                 count
             ),
             2,
+        )),
+        AppError::OverlappingPaths(outer, inner) => Some((
+            format!(
+                "path '{}' is inside '{}'. Pass non-overlapping paths.",
+                inner.display(),
+                outer.display()
+            ),
+            1,
         )),
     }
 }
@@ -4623,6 +4674,21 @@ mod tests {
     }
 
     #[test]
+    fn test_format_app_error_overlapping_paths() {
+        let outer = PathBuf::from("/some/outer");
+        let inner = PathBuf::from("/some/outer/inner");
+        let err = AppError::OverlappingPaths(outer.clone(), inner.clone());
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(msg.contains("is inside"));
+        assert!(msg.contains("non-overlapping paths"));
+        assert!(msg.contains(&inner.display().to_string()));
+        assert!(msg.contains(&outer.display().to_string()));
+        assert_eq!(code, 1);
+    }
+
+    #[test]
     fn test_format_app_error_move_dest_not_directory() {
         let path = PathBuf::from("/some/path");
         let err = AppError::MoveDestinationNotDirectory(path.clone());
@@ -4982,6 +5048,233 @@ mod tests {
         assert!(
             !file_b.exists(),
             "cross-dir duplicate b should be removed by root_index"
+        );
+    }
+
+    #[test]
+    fn test_detect_overlap_single_path_none() {
+        let temp = TempDir::new().expect("temp dir");
+        assert!(detect_overlap(&[temp.path().to_path_buf()]).is_none());
+    }
+
+    #[test]
+    fn test_detect_overlap_disjoint_none() {
+        let dir_a = TempDir::new().expect("temp a");
+        let dir_b = TempDir::new().expect("temp b");
+        assert!(
+            detect_overlap(&[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]).is_none()
+        );
+    }
+
+    #[test]
+    fn test_detect_overlap_nested_some() {
+        let parent = TempDir::new().expect("temp parent");
+        let child = parent.path().join("child");
+        fs::create_dir(&child).expect("create child");
+        let (outer, inner) = detect_overlap(&[parent.path().to_path_buf(), child.clone()])
+            .expect("expected overlap");
+        // Original (as-supplied) paths are returned, not canonicalized forms.
+        assert_eq!(outer, parent.path().to_path_buf());
+        assert_eq!(inner, child);
+    }
+
+    #[test]
+    fn test_detect_overlap_equal_some() {
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path().to_path_buf();
+        let (outer, inner) =
+            detect_overlap(&[dir.clone(), dir.clone()]).expect("equal paths must overlap");
+        assert_eq!(outer, dir);
+        assert_eq!(inner, dir);
+    }
+
+    #[test]
+    fn test_detect_overlap_shared_prefix_siblings_none() {
+        // Siblings whose names share a string prefix (`foo` vs `foobar`) must NOT
+        // be treated as overlapping. This pins the use of component-based
+        // `Path::starts_with`; a regression to string-based prefix matching would
+        // wrongly flag these as nested and this test would fail.
+        let parent = TempDir::new().expect("temp parent");
+        let foo = parent.path().join("foo");
+        let foobar = parent.path().join("foobar");
+        fs::create_dir(&foo).expect("create foo");
+        fs::create_dir(&foobar).expect("create foobar");
+        // Both orderings must be disjoint regardless of which is listed first.
+        assert!(detect_overlap(&[foo.clone(), foobar.clone()]).is_none());
+        assert!(detect_overlap(&[foobar, foo]).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_detect_overlap_symlink_aliased_root_some() {
+        // A real directory and a symlink pointing at it are lexically distinct
+        // paths but alias the same physical location. Canonicalization must
+        // collapse them so the overlap is detected. Dropping `fs::canonicalize`
+        // in `detect_overlap` makes this assertion fail.
+        let temp = TempDir::new().expect("temp dir");
+        let real = temp.path().join("real");
+        let real_sub = real.join("sub");
+        fs::create_dir_all(&real_sub).expect("create real/sub");
+        let link = temp.path().join("link");
+        symlink(&real, &link).expect("create symlink link -> real");
+
+        // Equal-after-resolution case: real and link resolve to the same dir.
+        assert!(
+            detect_overlap(&[real.clone(), link.clone()]).is_some(),
+            "real and its symlink alias must overlap"
+        );
+
+        // Nested-after-resolution case: link/sub resolves inside real.
+        let link_sub = link.join("sub");
+        assert!(
+            detect_overlap(&[real, link_sub]).is_some(),
+            "real and a subdir reached through the symlink must overlap"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_detect_overlap_junction_aliased_root_some() {
+        // A directory junction (created without admin/developer mode) aliases a
+        // target directory under a different path. Canonicalization must resolve
+        // the junction to its target so the overlap is detected. Dropping
+        // `fs::canonicalize` in `detect_overlap` makes this assertion fail.
+        let temp = TempDir::new().expect("temp dir");
+        let target = temp.path().join("target");
+        fs::create_dir(&target).expect("create target");
+        let junction = temp.path().join("junction");
+
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status();
+
+        // Skip gracefully if junction creation is unavailable in this
+        // environment rather than producing a false failure.
+        match status {
+            Ok(s) if s.success() && junction.exists() => {}
+            _ => return,
+        }
+
+        assert!(
+            detect_overlap(&[target, junction]).is_some(),
+            "target and its directory junction must overlap"
+        );
+    }
+
+    #[test]
+    fn test_run_app_rejects_nested_paths_without_modifying_disk() {
+        let _guard = lock_progress();
+        set_progress_env();
+        // Parent dir holds a duplicate that WOULD be deleted under --action delete
+        // --force; a child subdir is passed alongside the parent. The overlap check
+        // must reject the run before any destructive work, leaving both files intact.
+        let parent = TempDir::new().expect("temp parent");
+        let child = parent.path().join("child");
+        fs::create_dir(&child).expect("create child");
+        let file1 = parent.path().join("file1.txt");
+        let file2 = parent.path().join("file2.txt");
+        fs::write(&file1, b"duplicate").expect("write file1");
+        fs::write(&file2, b"duplicate").expect("write file2");
+
+        let args = Args {
+            directories: vec![parent.path().to_path_buf(), child.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(
+            matches!(result, Err(AppError::OverlappingPaths(_, _))),
+            "nested paths should be rejected, got: {:?}",
+            result
+        );
+        assert!(file1.exists(), "file1 must remain untouched");
+        assert!(file2.exists(), "file2 must remain untouched");
+    }
+
+    #[test]
+    fn test_run_app_rejects_same_path_twice() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path().to_path_buf();
+        fs::write(dir.join("file1.txt"), b"duplicate").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"duplicate").expect("write file2");
+
+        let args = Args {
+            directories: vec![dir.clone(), dir.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(
+            matches!(result, Err(AppError::OverlappingPaths(_, _))),
+            "the same directory passed twice must be rejected, got: {:?}",
+            result
+        );
+        assert!(
+            dir.join("file1.txt").exists(),
+            "file1 must remain untouched"
+        );
+        assert!(
+            dir.join("file2.txt").exists(),
+            "file2 must remain untouched"
+        );
+    }
+
+    #[test]
+    fn test_run_app_disjoint_paths_not_rejected() {
+        let _guard = lock_progress();
+        set_progress_env();
+        let dir_a = TempDir::new().expect("temp a");
+        let dir_b = TempDir::new().expect("temp b");
+        fs::write(dir_a.path().join("a.txt"), b"content").expect("write a");
+        fs::write(dir_b.path().join("b.txt"), b"content").expect("write b");
+
+        let args = Args {
+            directories: vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+            action: None,
+            dest: None,
+            force: false,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(
+            result.is_ok(),
+            "disjoint paths should scan normally, got: {:?}",
+            result
         );
     }
 }

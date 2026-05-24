@@ -431,6 +431,27 @@ fn cli_json_summary_directories_match_order() {
     );
 }
 
+#[test]
+fn cli_nested_paths_rejected() {
+    // A parent directory and one of its subdirectories passed together must be
+    // rejected before any scan, with the overlap message on stderr.
+    let parent = assert_fs::TempDir::new().expect("create parent");
+    let child = parent.child("child");
+    child.create_dir_all().expect("create child");
+
+    cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            parent.path().to_str().unwrap(),
+            child.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("is inside"))
+        .stderr(predicates::str::contains("non-overlapping paths"));
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_fail_on_error_sets_exit_status() {
