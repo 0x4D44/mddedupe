@@ -5289,6 +5289,115 @@ mod tests {
     }
 
     #[test]
+    fn test_group_entirely_on_later_path_consolidates() {
+        let _guard = lock_progress();
+        set_progress_env();
+        // HLD §7 test 3 (literal form): a duplicate set living ONLY under the
+        // second listed path. The first path holds an unrelated, unique file and
+        // none of the duplicate set's members. The group must still collapse to a
+        // single survivor under the second path, and a delete action must remove
+        // exactly one of the two copies there.
+        let parent = TempDir::new().expect("temp parent");
+        let p1 = parent.path().join("p1");
+        let p2 = parent.path().join("p2");
+        fs::create_dir(&p1).expect("create p1");
+        fs::create_dir(&p2).expect("create p2");
+        // p1 holds only a unique file (not part of the duplicate set).
+        let unique = p1.join("unique.txt");
+        fs::write(&unique, b"unique content not duplicated").expect("write unique");
+        // Both members of the duplicate set live exclusively under p2.
+        let file_b1 = p2.join("b1.txt");
+        let file_b2 = p2.join("b2.txt");
+        fs::write(&file_b1, b"shared content").expect("write b1");
+        fs::write(&file_b2, b"shared content").expect("write b2");
+
+        let args = Args {
+            directories: vec![p1.clone(), p2.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        // The group collapses to one survivor under p2 (b1 sorts before b2), and
+        // exactly one of the two copies remains. The unrelated unique file is
+        // untouched.
+        assert!(
+            file_b1.exists(),
+            "survivor b1 should remain (first path within p2)"
+        );
+        assert!(
+            !file_b2.exists(),
+            "duplicate b2 entirely on later path should be removed"
+        );
+        assert!(unique.exists(), "unrelated unique file must be untouched");
+    }
+
+    #[test]
+    fn test_survivor_is_earliest_listed_not_alphabetical() {
+        let _guard = lock_progress();
+        set_progress_env();
+        // The first-listed path holds NO copy of the duplicate set. The set spans
+        // two LATER paths whose alphabetical order disagrees with listing order:
+        // we name them `zzz` and `aaa` (so `aaa` < `zzz` alphabetically) but list
+        // `zzz` before `aaa`. The survivor must be the earliest *listed* path that
+        // holds a copy (`zzz`, lower root_index), NOT the alphabetically-first one
+        // (`aaa`). This fails if `survivor_cmp` is reduced to path-only ordering.
+        let parent = TempDir::new().expect("temp parent");
+        let empty_first = parent.path().join("empty_first");
+        let zzz = parent.path().join("zzz");
+        let aaa = parent.path().join("aaa");
+        fs::create_dir(&empty_first).expect("create empty_first");
+        fs::create_dir(&zzz).expect("create zzz");
+        fs::create_dir(&aaa).expect("create aaa");
+        // The duplicate set lives only on zzz and aaa.
+        let file_zzz = zzz.join("dup.txt");
+        let file_aaa = aaa.join("dup.txt");
+        fs::write(&file_zzz, b"shared content").expect("write zzz");
+        fs::write(&file_aaa, b"shared content").expect("write aaa");
+
+        let args = Args {
+            // empty_first is listed first (no copy), then zzz, then aaa.
+            directories: vec![empty_first.clone(), zzz.clone(), aaa.clone()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok());
+        // Survivor is the earliest *listed* copy (zzz, root_index 1), even though
+        // aaa sorts first alphabetically. A path-only survivor_cmp would keep aaa.
+        assert!(
+            file_zzz.exists(),
+            "survivor should be the earliest-listed copy (zzz), not alphabetical"
+        );
+        assert!(
+            !file_aaa.exists(),
+            "alphabetically-first but later-listed copy (aaa) should be removed"
+        );
+    }
+
+    #[test]
     fn test_detect_overlap_single_path_none() {
         let temp = TempDir::new().expect("temp dir");
         assert!(detect_overlap(&[temp.path().to_path_buf()]).is_none());
