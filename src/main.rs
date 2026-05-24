@@ -375,6 +375,51 @@ fn hash_file(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Collapses a single hash group so that each distinct physical file (`FileId`)
+/// appears at most once. This is the identity safety net (HLD §5.4): overlap
+/// rejection is lexical at the root level and does not stop the same physical
+/// file from entering a group twice via a symlink or junction discovered
+/// mid-walk (e.g. a real file plus a `--follow-symlinks` view of itself). Acting
+/// on such a "duplicate" would destroy the data the survivor points at.
+///
+/// For each entry we resolve its `FileId` via `fs::metadata` and keep exactly one
+/// entry per distinct identity. Among entries sharing an identity, the survivor
+/// preference is preserved by keeping the one that sorts first under
+/// `survivor_cmp` (lowest `root_index`, then alphabetical path). An entry whose
+/// metadata cannot be read is treated as having a distinct identity and is never
+/// collapsed away — it is safer to keep it than to silently drop it.
+///
+/// This runs only over already-filtered candidate groups (tiny), so there is no
+/// hot-loop cost.
+fn collapse_group_by_identity(group: &mut Vec<DuplicateEntry>) {
+    let mut seen: HashMap<FileId, usize> = HashMap::new();
+    let mut distinct: Vec<DuplicateEntry> = Vec::with_capacity(group.len());
+    for entry in group.drain(..) {
+        let id = match fs::metadata(&entry.0) {
+            Ok(metadata) => Some(file_id_from_metadata(&entry.0, &metadata)),
+            Err(_) => None,
+        };
+        match id {
+            Some(id) => match seen.get(&id).copied() {
+                Some(index) => {
+                    // Already have a representative for this physical file; keep
+                    // whichever entry sorts first so the survivor preference holds.
+                    if survivor_cmp(&entry, &distinct[index]) == std::cmp::Ordering::Less {
+                        distinct[index] = entry;
+                    }
+                }
+                None => {
+                    seen.insert(id, distinct.len());
+                    distinct.push(entry);
+                }
+            },
+            // Unreadable metadata: treat as a distinct identity, never collapse away.
+            None => distinct.push(entry),
+        }
+    }
+    *group = distinct;
+}
+
 /// Scans the directory tree, groups files by size, and then for each group with more than one file,
 /// computes the file hash in parallel. While hashing, a progress indicator shows how many candidate
 /// files have been processed (on a single line in-place).
@@ -599,6 +644,14 @@ fn find_duplicates_in_dirs(
 
     if cancellation_requested() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+    }
+
+    // Identity safety net (HLD §5.4): collapse each hash group so a single
+    // physical file appears at most once BEFORE the len>1 filter and before
+    // duplicate_count/wasted_space are computed, so reporting and actions both
+    // count an aliased file once and can never act on the survivor itself.
+    for group in duplicates.values_mut() {
+        collapse_group_by_identity(group);
     }
 
     duplicates.retain(|_, group| group.len() > 1);
@@ -3098,6 +3151,181 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_collapse_group_by_identity_keeps_one_per_physical_file() {
+        // Two paths that resolve to the SAME physical file (real path plus an
+        // equivalent path through `subdir/..`) share a FileId on every platform
+        // (dev+ino on Unix, canonical path on Windows). The collapse must keep
+        // exactly one entry, preferring the lowest root_index.
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::create_dir(dir.join("subdir")).expect("create subdir");
+        let real = dir.join("file.txt");
+        fs::write(&real, b"payload").expect("write file");
+        let alias = dir.join("subdir").join("..").join("file.txt");
+
+        // alias listed under a LATER root_index than the real path; the survivor
+        // preference (lowest root_index) must keep the real path entry.
+        let mut group: Vec<DuplicateEntry> = vec![(alias.clone(), 7, 1), (real.clone(), 7, 0)];
+        collapse_group_by_identity(&mut group);
+
+        assert_eq!(group.len(), 1, "aliased physical file must collapse to one");
+        assert_eq!(group[0].2, 0, "lowest root_index entry must be kept");
+    }
+
+    #[test]
+    fn test_collapse_group_by_identity_preserves_distinct_and_unreadable() {
+        // Two genuinely distinct files must both survive the collapse; an entry
+        // whose metadata cannot be read (nonexistent path) must NOT be dropped.
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        fs::write(&f1, b"payload").expect("write a");
+        fs::write(&f2, b"payload").expect("write b");
+        let missing = dir.join("does_not_exist.txt");
+
+        let mut group: Vec<DuplicateEntry> = vec![
+            (f1.clone(), 7, 0),
+            (f2.clone(), 7, 0),
+            (missing.clone(), 7, 0),
+        ];
+        collapse_group_by_identity(&mut group);
+
+        assert_eq!(
+            group.len(),
+            3,
+            "distinct files and an unreadable entry must all be retained"
+        );
+    }
+
+    /// On Unix, two hardlinks to the same inode share a `FileId` (`dev`+`ino`),
+    /// so the identity collapse treats them as ONE physical file: they must not
+    /// be reported as duplicates (a hardlink shares storage — deleting one link
+    /// frees nothing), and an `--action delete --force` run must leave BOTH link
+    /// paths intact. This pins the intended hardlink behavior documented in
+    /// HLD §5.4 / ARCHITECTURE.md. (Windows uses canonical-path identity, where
+    /// each NTFS hardlink is its own path, so this property is Unix-specific.)
+    #[test]
+    #[cfg(unix)]
+    fn test_unix_hardlinks_not_duplicates_and_survive_delete() {
+        let _guard = lock_progress();
+        set_progress_env();
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let link_a = dir.join("link_a.txt");
+        let link_b = dir.join("link_b.txt");
+        fs::write(&link_a, b"hardlinked payload").expect("write link_a");
+        fs::hard_link(&link_a, &link_b).expect("create hardlink");
+
+        // Read-only scan: the two links share an inode, so after the identity
+        // collapse the group has a single member and is dropped by the len>1
+        // filter. No duplicates, no wasted space, no duplicate groups.
+        let (groups, scanned, duplicate_count, wasted, _) =
+            scan_one(dir, false, false, false).expect("scan");
+        assert_eq!(scanned, 2, "both link paths are walked");
+        assert_eq!(
+            duplicate_count, 0,
+            "hardlinks to one inode must not be reported as duplicates"
+        );
+        assert_eq!(wasted, 0, "a hardlink shares storage, so wastes nothing");
+        assert!(
+            groups.is_empty(),
+            "no duplicate groups should remain after identity collapse"
+        );
+
+        // Destructive run: nothing should be unlinked.
+        let args = Args {
+            directories: vec![dir.to_path_buf()],
+            action: Some("delete".to_string()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            summary_format: SummaryFormat::Text,
+            fail_on_error: false,
+        };
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok(), "delete run should succeed: {result:?}");
+        assert!(link_a.exists(), "first hardlink must survive");
+        assert!(link_b.exists(), "second hardlink must survive");
+    }
+
+    /// Mixed group shape `{F, F-alias, G}`: a physical file `F` reachable through
+    /// two scanned roots as an alias pair (here via a hardlink so the property
+    /// holds without `--follow-symlinks`), PLUS a genuinely distinct file `G`
+    /// with identical content on a third root. `F`'s earliest occurrence is
+    /// root0. After `--action delete --force`:
+    ///   * the earliest-listed copy of `F` (root0) survives,
+    ///   * `G`'s redundant copy IS acted on (one real duplicate handled),
+    ///   * no alias of `F` is destroyed.
+    /// This pins survivor preservation when an alias and a true duplicate coexist.
+    #[test]
+    #[cfg(unix)]
+    fn test_mixed_alias_and_real_duplicate_survivor_preserved() {
+        let _guard = lock_progress();
+        set_progress_env();
+
+        let temp = TempDir::new().expect("temp dir");
+        // Three sibling roots so root ordering is deterministic.
+        let root0 = temp.path().join("root0");
+        let root1 = temp.path().join("root1");
+        let root2 = temp.path().join("root2");
+        fs::create_dir(&root0).expect("create root0");
+        fs::create_dir(&root1).expect("create root1");
+        fs::create_dir(&root2).expect("create root2");
+
+        // F: one physical file, hardlinked across root0 (earliest) and root1.
+        let f_primary = root0.join("f.txt");
+        let f_alias = root1.join("f.txt");
+        fs::write(&f_primary, b"shared content").expect("write f_primary");
+        fs::hard_link(&f_primary, &f_alias).expect("hardlink f_alias");
+
+        // G: a genuinely distinct file on root2 with identical content — a real
+        // duplicate of F that must be acted on.
+        let g = root2.join("g.txt");
+        fs::write(&g, b"shared content").expect("write g");
+
+        let args = Args {
+            directories: vec![root0.clone(), root1.clone(), root2.clone()],
+            action: Some("delete".to_string()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            summary_format: SummaryFormat::Text,
+            fail_on_error: false,
+        };
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok(), "delete run should succeed: {result:?}");
+
+        // Identity collapse leaves {F (root0), G (root2)} as the real group;
+        // F is the survivor (lowest root_index), G's copy is deleted.
+        assert!(
+            f_primary.exists(),
+            "earliest copy of F (root0) must survive as the group survivor"
+        );
+        assert!(
+            f_alias.exists(),
+            "no alias of F may be destroyed (hardlink collapsed before action)"
+        );
+        assert!(
+            !g.exists(),
+            "G is a genuine duplicate of F and must be deleted"
+        );
+    }
+
     // ==================== Stage 2: Error Path Tests ====================
 
     #[test]
@@ -4803,10 +5031,19 @@ mod tests {
             symlink(&target, &link).expect("create symlink");
 
             // Scan with follow_symlinks=true
-            let (_, scanned, _, _, _) = scan_one(dir, false, false, true).expect("scan");
+            let (_, scanned, duplicate_count, _, _) =
+                scan_one(dir, false, false, true).expect("scan");
 
             // Should scan both target and link
             assert_eq!(scanned, 2);
+            // The symlinked view of a file is the SAME physical file, not a
+            // duplicate of it: the identity collapse must drop the pair so no
+            // duplicate is reported. Pins the self-duplicate fix against
+            // regression.
+            assert_eq!(
+                duplicate_count, 0,
+                "a symlink to a file is not a duplicate of that file"
+            );
         }
     }
 
@@ -5275,6 +5512,142 @@ mod tests {
             result.is_ok(),
             "disjoint paths should scan normally, got: {:?}",
             result
+        );
+    }
+
+    // ==================== Stage C: Identity Safety Net & Cross-Device ====================
+
+    #[test]
+    #[cfg(unix)]
+    fn test_identity_safety_net_does_not_delete_aliased_file() {
+        // A single physical file reachable twice within the scanned tree (the real
+        // file plus a symlinked view of itself under --follow-symlinks) must NOT be
+        // reported as a duplicate of itself, and must NOT be deleted. Without the
+        // identity collapse, the symlink-followed view and the real file share a
+        // hash and form a bogus duplicate pair; the survivor selection would then
+        // act on one of them and destroy the only physical copy.
+        let _guard = lock_progress();
+        set_progress_env();
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let real = dir.join("real.txt");
+        fs::write(&real, b"the only copy").expect("write real file");
+        // A symlink in the same tree makes the same physical file reachable a
+        // second time when symlinks are followed.
+        let link = dir.join("alias.txt");
+        symlink(&real, &link).expect("create symlink alias");
+
+        // Read-only scan first: the duplicate count must not be inflated.
+        let (dups, _, dup_count, wasted, _) =
+            scan_one(dir, false, false, true).expect("scan with follow-symlinks");
+        assert_eq!(
+            dup_count, 0,
+            "an aliased physical file must not count as its own duplicate"
+        );
+        assert_eq!(wasted, 0, "no wasted space for a single physical file");
+        assert!(
+            dups.is_empty(),
+            "no duplicate groups should survive the identity collapse"
+        );
+
+        // Now drive a destructive action: the real file must survive.
+        let args = Args {
+            directories: vec![dir.to_path_buf()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: true,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(result.is_ok(), "scan should succeed, got: {:?}", result);
+        assert!(
+            real.exists(),
+            "the only physical copy must not be deleted via its symlink alias"
+        );
+        assert_eq!(
+            fs::read(&real).expect("read survivor"),
+            b"the only copy",
+            "survivor content must be intact"
+        );
+    }
+
+    #[test]
+    fn test_cross_device_move_falls_back_to_copy() {
+        // A real multi-path duplicate scenario driven through --action move --dest,
+        // with the first rename forced to fail with EXDEV so the relocate_file
+        // copy-fallback (now the common path for cross-drive moves) is exercised.
+        let _guard = lock_progress();
+        set_progress_env();
+        env::remove_var("MDDEDUPE_PROGRESS_FAIL");
+
+        let parent = TempDir::new().expect("temp parent");
+        let dir_a = parent.path().join("aaa");
+        let dir_b = parent.path().join("bbb");
+        fs::create_dir(&dir_a).expect("create aaa");
+        fs::create_dir(&dir_b).expect("create bbb");
+        let file_a = dir_a.join("copy.txt");
+        let file_b = dir_b.join("copy.txt");
+        fs::write(&file_a, b"cross device payload").expect("write a");
+        fs::write(&file_b, b"cross device payload").expect("write b");
+
+        let dest_dir = TempDir::new().expect("dest dir");
+        let dest_path = dest_dir.path().to_path_buf();
+
+        #[cfg(unix)]
+        let cross_device_err = 18;
+        #[cfg(windows)]
+        let cross_device_err = 17;
+        // The single non-survivor (under dir_b) triggers exactly one relocate; its
+        // rename fails cross-device and must fall back to copy+delete.
+        test_support::enqueue_rename_result(Err(io::Error::from_raw_os_error(cross_device_err)));
+
+        let args = Args {
+            directories: vec![dir_a.clone(), dir_b.clone()],
+            action: Some("move".into()),
+            dest: Some(dest_path.clone()),
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error: false,
+        };
+
+        let result = run_app(args, Cursor::new(Vec::new()));
+        assert!(
+            result.is_ok(),
+            "cross-device move should succeed via copy fallback, got: {:?}",
+            result
+        );
+        // Survivor (first-listed dir) stays put; duplicate is relocated via copy.
+        assert!(file_a.exists(), "survivor under first dir should remain");
+        assert!(
+            !file_b.exists(),
+            "duplicate under second dir should be moved away"
+        );
+        let moved: Vec<_> = fs::read_dir(&dest_path)
+            .expect("read dest")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect dest entries");
+        assert_eq!(moved.len(), 1, "exactly one file relocated to destination");
+        assert_eq!(
+            fs::read(moved[0].path()).expect("read moved file"),
+            b"cross device payload",
+            "relocated content must match"
         );
     }
 }

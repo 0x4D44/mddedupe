@@ -452,6 +452,101 @@ fn cli_nested_paths_rejected() {
         .stderr(predicates::str::contains("non-overlapping paths"));
 }
 
+#[test]
+fn cli_variadic_positional_parses_when_interleaved_with_options() {
+    // The `directories` positional is variadic (num_args = 1..). Verify clap
+    // parses it correctly in three interleaving shapes against options. Each run
+    // must succeed and scan exactly the directories supplied — confirmed via the
+    // "Starting duplicate scan in:" startup line which echoes all supplied paths.
+
+    // (a) single dir followed by options: `dir --action delete --force`
+    {
+        let temp = create_duplicate_fixture();
+        let dir = temp.path();
+        let duplicate = dir.join("file2.txt");
+        cargo_bin_cmd!("mddedupe")
+            .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+            .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+            .args([dir.to_str().unwrap(), "--action", "delete", "--force"])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains(dir.to_str().unwrap()));
+        assert!(
+            !duplicate.exists(),
+            "duplicate should be deleted in case (a)"
+        );
+    }
+
+    // (b) two dirs first, then options.
+    {
+        let dir_a = assert_fs::TempDir::new().expect("create dir a");
+        let dir_b = assert_fs::TempDir::new().expect("create dir b");
+        dir_a.child("a.txt").write_str("content").expect("write a");
+        dir_b.child("b.txt").write_str("content").expect("write b");
+
+        let output = cargo_bin_cmd!("mddedupe")
+            .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+            .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+            .args([
+                dir_a.path().to_str().unwrap(),
+                dir_b.path().to_str().unwrap(),
+                "--quiet",
+                "--log-level",
+                "none",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let stdout = String::from_utf8(output).expect("stdout should be valid UTF-8");
+        let start_line = stdout
+            .lines()
+            .find(|line| line.starts_with("Starting duplicate scan in:"))
+            .expect("startup line should be present in case (b)");
+        assert!(
+            start_line.contains(dir_a.path().to_str().unwrap())
+                && start_line.contains(dir_b.path().to_str().unwrap()),
+            "both dirs should be scanned in case (b), got: {}",
+            start_line
+        );
+    }
+
+    // (c) options before two dirs: `--quiet dir1 dir2`.
+    {
+        let dir_a = assert_fs::TempDir::new().expect("create dir a");
+        let dir_b = assert_fs::TempDir::new().expect("create dir b");
+        dir_a.child("a.txt").write_str("content").expect("write a");
+        dir_b.child("b.txt").write_str("content").expect("write b");
+
+        let output = cargo_bin_cmd!("mddedupe")
+            .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+            .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+            .args([
+                "--log-level",
+                "none",
+                dir_a.path().to_str().unwrap(),
+                dir_b.path().to_str().unwrap(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let stdout = String::from_utf8(output).expect("stdout should be valid UTF-8");
+        let start_line = stdout
+            .lines()
+            .find(|line| line.starts_with("Starting duplicate scan in:"))
+            .expect("startup line should be present in case (c)");
+        assert!(
+            start_line.contains(dir_a.path().to_str().unwrap())
+                && start_line.contains(dir_b.path().to_str().unwrap()),
+            "both dirs should be scanned in case (c), got: {}",
+            start_line
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_fail_on_error_sets_exit_status() {
