@@ -111,6 +111,63 @@ When running tests, progress is typically disabled via environment variables to 
 - `MDDEDUPE_HASH_PROGRESS_MS`: Progress update interval for hash stage (default: 500ms, set to 0 to disable)
 - `MDDEDUPE_PROGRESS_FAIL`: Internal test hook for simulating progress failures (used in tests only)
 
+## Survivor Selection
+
+This subsection covers the protect-then-fallback system added in the configurable survivor selection feature. The engine lives in three functions: `resolve_keep_policy`, `select_survivors`, and `build_group_plans`.
+
+### `KeepPolicy` and `FallbackStrategy`
+
+```rust
+struct KeepPolicy {
+    protect_dir:  GlobSet,          // matched against each ancestor directory component
+    protect_name: GlobSet,          // matched against the file's own name
+    fallback:     FallbackStrategy, // oldest | newest | shortest | lexical
+}
+```
+
+`KeepPolicy::default()` is the **neutral policy**: empty GlobSets and `Lexical` fallback. This reproduces the original `survivor_cmp` behavior exactly (`root_index → path`) and is what `--no-protect` (without `--keep`) activates. When `--no-protect --keep oldest` (or any other `--keep` value) is passed, the result has empty protect lists but a non-`Lexical` fallback — not `KeepPolicy::default()`. Unit tests that need the neutral policy construct it directly via `KeepPolicy::default()`.
+
+The **CLI-resolved default** (no config file, no flags) is different: `protect-dir = ["0*"]`, `protect-name = ["00-*", "00 - *"]`, `fallback = Oldest`. These constants are defined once as `DEFAULT_PROTECT_DIR`, `DEFAULT_PROTECT_NAME`, and `DEFAULT_FALLBACK` so config resolution and any "use default for this field" branch share a single source.
+
+Glob matching is case-insensitive (`GlobBuilder::case_insensitive(true)`) and is applied to individual component strings via `to_string_lossy`, not to full paths. A bad glob pattern causes an `AppError::InvalidGlob` exit before any scan.
+
+### `resolve_keep_policy`
+
+`resolve_keep_policy(args, base_dir)` builds the `KeepPolicy` for a run from CLI flags and the config file. Per-dimension merge rules (flags win):
+
+- **protect lists** — `--no-protect` forces both empty; else a passed `--protect-dir`/`--protect-name` replaces the list; else the config field (when present); else the built-in convention default.
+- **fallback** — if `--no-protect`: `--keep` if passed, else `Lexical`. Otherwise: `--keep` if passed, else the config `fallback` if present, else `DEFAULT_FALLBACK` (`Oldest`).
+
+Config is loaded by `load_config`, which honors `--config <path>` as an explicit path (fatal if missing), then auto-discovers `./.mddedupe.toml` (silent if absent), then returns `None`. Any error — unreadable file, TOML parse failure, invalid glob — is fatal and exits non-zero before scanning.
+
+### `select_survivors`
+
+`select_survivors(group, policy)` partitions a single hash group into survivors and victims:
+
+1. Each entry is tested by `protect_reason`, which checks `any_ancestor_dir_matches` (dir rule) then `file_name_matches` (name rule). The dir rule wins the explain label when both match.
+2. If any entries are protected, all protected entries are survivors and all unprotected are victims. If every entry is protected, there are no victims.
+3. If nothing is protected, mtime keys are read once per entry (only for `Oldest`/`Newest`; `None` for others), the entries are sorted by `fallback_cmp` (`root_index → strategy key → path`), and the first element is the sole survivor.
+
+The function returns `(Vec<(&DuplicateEntry, SurvivorReason)>, Vec<&DuplicateEntry>)`. `SurvivorReason` (`ProtectedDir`, `ProtectedName`, `Fallback`) drives the `KEPT (…)` explain label produced by `survivor_reason_label`.
+
+### `GroupPlan` — single source of truth
+
+```rust
+struct GroupPlan<'a> {
+    hash:      &'a str,
+    survivors: Vec<(&'a DuplicateEntry, SurvivorReason)>,
+    victims:   Vec<&'a DuplicateEntry>,
+}
+```
+
+`build_group_plans` calls `select_survivors` **exactly once per group** and stores the result. All downstream consumers — the read-only display listing, `process_duplicates` (action), and the removable/reclaimable metric computation — read these stored plans. This design guarantee means the displayed `KEPT` file, the file actually acted on, and the removable counts provably reference the same partition. Independent re-evaluations (which for `oldest`/`newest` could read a changed mtime and elect a different survivor) are impossible.
+
+The removable metric is the sum of `GroupPlan::victim_bytes()` across all plans. The redundancy metric (`redundant_files`, `redundant_bytes`) is computed separately in `find_duplicates_in_dirs` as `Σ(group.len()-1)` before the policy is applied, so it always reflects total duplication regardless of how many survivors the policy retains. `format_scan_summary` emits the divergent wording only when `removable_files != redundant_files`.
+
+### Protect-aware identity collapse
+
+`collapse_group_by_identity` (called inside `find_duplicates_in_dirs`) is protect-aware: when two entries share a `FileId` (same physical file reached through multiple paths), the alias that survives the collapse is the one preferred under the current policy — a protected alias is kept over an unprotected one; when both are equal, `survivor_cmp` decides. This ensures that a file both reachable through a protected path and through an unprotected path is counted as protected, and can never be both a survivor and a victim.
+
 ## Multi-Path Scanning
 
 `mddedupe` accepts **one or more** directories in a single run and finds
@@ -167,7 +224,7 @@ Uses `clap` with derive macros:
 1. **Adding new features**: Most logic lives in `run_app()` or helper functions called from it
 2. **Testing**: Always add both unit tests (in `#[cfg(test)]` module) and integration tests (in `tests/cli.rs`)
 3. **Progress indicators**: Use `show_progress` flag and respect `quiet` mode
-4. **Actions on duplicates**: Always preserve the first file in each group (sorted by path), only process `sorted_files.iter().skip(1)`
+4. **Actions on duplicates**: Victims are determined by `build_group_plans` (protect-then-fallback). Iterate `GroupPlan::victims` — never re-derive the partition independently
 
 ## Common Pitfalls
 

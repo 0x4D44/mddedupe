@@ -18,7 +18,7 @@ A fast, safe, and user-friendly command-line tool written in Rust for finding an
 ### Safety First
 - **Read-only by default**: Requires explicit action flag for modifications
 - **Confirmation prompts**: Interactive approval for destructive operations (bypass with `--force`)
-- **Preserves originals**: Always keeps the first file (alphabetically) in each duplicate group
+- **Configurable survivor selection**: Protected files are never acted on; fallback strategy picks the keeper among unprotected copies
 - **Graceful cancellation**: Ctrl+C handling with proper cleanup and exit codes
 - **Comprehensive error reporting**: Aggregates all failures without stopping the entire operation
 
@@ -136,6 +136,13 @@ mddedupe [OPTIONS] <DIRECTORY>
 
 **Scanning Behavior:**
 - `--follow-symlinks` - Follow symbolic links during scan (default: disabled for safety). A cycle guard skips already-visited directories to prevent infinite recursion.
+
+**Survivor Selection:**
+- `--protect-dir <GLOB>` - Protect files under a directory whose name matches this glob (repeatable). Replaces the config/default dir list.
+- `--protect-name <GLOB>` - Protect files whose own name matches this glob (repeatable). Replaces the config/default name list.
+- `--no-protect` - Disable all protect rules for this run; uses `lexical` fallback (original behavior), unless `--keep` overrides.
+- `--keep <STRATEGY>` - Fallback strategy for unprotected groups: `oldest`, `newest`, `shortest`, or `lexical`.
+- `--config <PATH>` - Explicit path to a `.mddedupe.toml` config file.
 
 **Help:**
 - `-h, --help` - Display help information
@@ -284,23 +291,30 @@ Stage 2: SHA-256 Hashing (Parallel)
 4. **Parallel Hashing**: Compute SHA-256 for candidates using Rayon thread pool
 5. **Hash Grouping**: Group by hash in HashMap<String, Vec<(Path, Size)>>
 6. **Duplicate Identification**: Retain hash groups with 2+ files
-7. **Action Execution**: Apply move/trash/delete to all but first file in each group
+7. **Action Execution**: Apply move/trash/delete to all victims in each group (unprotected non-keepers as chosen by the protect-then-fallback policy)
 
-### File Preservation Logic
+### Survivor Selection
 
-**The first file alphabetically** in each duplicate group is always preserved:
+mddedupe uses a **protect-then-fallback** model to decide which copy of each duplicate group is kept:
+
+1. **Protect rules** mark certain files as untouchable. Any file whose path includes a directory component matching a dir-glob, or whose filename matches a name-glob, is protected. All protected copies in a group are kept; only unprotected copies are candidates for removal.
+2. **Fallback strategy** picks the single keeper among the unprotected copies when no file is protected. The chain is `root_index → strategy key → path`, always deterministic.
+
+**Built-in convention (no config, no flags):** protects directories whose name matches `0*` and filenames matching `00-*` or `00 - *`, with `oldest` as the fallback for unprotected groups. This reflects a common "master copy" naming convention.
+
+> **Important — the protect convention is ON by default.** The `0*` glob matches any single directory component that starts with the digit zero, including `0` (a bare single-character name), `007`, `0day`, `0001-Jan`, and similar. A plain `mddedupe --action delete <dir>` run will **silently keep** duplicates under any such directory rather than deleting them. If your directory tree uses a numeric-prefix naming scheme that is unrelated to this convention (e.g. `0001-Jan`, `0002-Feb` photo folders), some duplicates you expect to be removed will not be. Pass `--no-protect` to disable all protect rules, or `--no-protect --keep lexical` to reproduce the original first-by-`(root_index, path)` behavior exactly.
+
+**Example** — scanning a tree with both protected and unprotected copies:
 
 ```
-Given duplicates:
-  /home/user/documents/report.txt
-  /home/user/downloads/report.txt
-  /home/user/backup/report.txt
-
-After sorting:
-  /home/user/backup/report.txt     ← PRESERVED
-  /home/user/documents/report.txt  ← Processed
-  /home/user/downloads/report.txt  ← Processed
+D:\pix\00-keep\photo.jpg   -> KEPT (protected: dir 00-keep)
+D:\pix\2024\photo.jpg      -> remove
+D:\pix\tmp\photo copy.jpg  -> remove
 ```
+
+Each kept file is annotated with `KEPT (reason)` in the output. The summary line shows both the total redundancy count and, when protect rules retain extra survivors, the separately-computed removable/reclaimable figures.
+
+For full flag reference, `.mddedupe.toml` format, and precedence rules see [docs/usage.md](./docs/usage.md).
 
 ## Architecture
 
@@ -320,7 +334,7 @@ For detailed architecture documentation including algorithm details, key functio
 1. **Read-only default**: No modifications without explicit `--action` flag
 2. **Confirmation prompts**: Interactive approval for destructive operations
 3. **Force flag required**: Automation requires explicit `--force` flag
-4. **Original preservation**: First file in each group always kept
+4. **Protected-copy preservation**: Protected files are never acted on; the fallback strategy (default: `oldest`) picks the keeper among any remaining unprotected copies
 5. **Graceful cancellation**: Ctrl+C exits cleanly with exit code 130
 6. **Error aggregation**: Individual failures don't stop entire operation
 7. **Cross-device support**: Automatic fallback for moves across filesystems
