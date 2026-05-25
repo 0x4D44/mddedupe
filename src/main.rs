@@ -2400,6 +2400,106 @@ mod tests {
         reset_cancellation_flag();
     }
 
+    /// A minimal `--action delete --force --no-protect` argument set over a single
+    /// directory, used by the TOCTOU tests below. `--no-protect` pins the neutral
+    /// policy so the lexically-first file (`file1.txt`) is the deterministic
+    /// survivor and `file2.txt` is the victim.
+    fn toctou_delete_args(dir: &Path, fail_on_error: bool) -> Args {
+        Args {
+            directories: vec![dir.to_path_buf()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: true,
+            keep: None,
+            config: None,
+        }
+    }
+
+    #[test]
+    fn test_toctou_victim_vanishes_between_hash_and_delete_is_reported() {
+        // TOCTOU (vanish): a victim is removed in the window between hashing (the
+        // "check") and the destructive action (the "use"). The post-hash hook fires
+        // after every file is hashed but before any victim is acted on, so it
+        // reproduces the race deterministically. The run must not crash, the
+        // SURVIVOR must stay intact, and with `--fail-on-error` the vanished victim
+        // must surface as a reported per-file failure rather than being silently
+        // swallowed or aborting the group mid-way.
+        let _guard = lock_progress();
+        set_progress_env();
+        reset_cancellation_flag();
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let survivor = dir.join("file1.txt");
+        let victim = dir.join("file2.txt");
+        fs::write(&survivor, b"dup").expect("write survivor");
+        fs::write(&victim, b"dup").expect("write victim");
+
+        let victim_in_hook = victim.clone();
+        test_support::set_post_hash_hook(move || {
+            fs::remove_file(&victim_in_hook).expect("hook removes the victim mid-run");
+        });
+
+        let result = run_app(toctou_delete_args(dir, true), Cursor::new(Vec::new()));
+        assert!(
+            matches!(result, Err(AppError::ActionFailures(1))),
+            "a victim that vanished mid-run must be reported as one failure, got: {:?}",
+            result
+        );
+        assert!(survivor.exists(), "the survivor must remain after the race");
+        assert!(!victim.exists(), "the victim is gone (removed in the race)");
+        reset_cancellation_flag();
+    }
+
+    #[test]
+    fn test_toctou_victim_modified_after_hash_is_still_deleted() {
+        // TOCTOU (change), documented limitation: the action acts on the
+        // survivor/victim PLAN computed from scan-time hashes — it does NOT re-hash
+        // at delete time. A victim whose CONTENT changes in the window between
+        // hashing and deletion is therefore still deleted, even though it is no
+        // longer a duplicate of the survivor. This pins the current (inherent)
+        // behavior so that adding a re-verification step later is a deliberate,
+        // visible change rather than an accident.
+        let _guard = lock_progress();
+        set_progress_env();
+        reset_cancellation_flag();
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let survivor = dir.join("file1.txt");
+        let victim = dir.join("file2.txt");
+        fs::write(&survivor, b"dup").expect("write survivor");
+        fs::write(&victim, b"dup").expect("write victim");
+
+        let victim_in_hook = victim.clone();
+        test_support::set_post_hash_hook(move || {
+            fs::write(&victim_in_hook, b"CHANGED - no longer a duplicate")
+                .expect("hook mutates the victim mid-run");
+        });
+
+        let result = run_app(toctou_delete_args(dir, false), Cursor::new(Vec::new()));
+        assert!(result.is_ok(), "the run should complete: {:?}", result);
+        assert!(survivor.exists(), "the survivor is untouched");
+        assert!(
+            !victim.exists(),
+            "the victim is deleted despite its content no longer matching — the \
+             scan-time plan is not re-verified at action time"
+        );
+        reset_cancellation_flag();
+    }
+
     #[test]
     fn test_write_summary_to_path_handles_nested_dirs_and_newline() {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
