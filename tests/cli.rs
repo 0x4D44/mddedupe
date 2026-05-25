@@ -27,7 +27,7 @@ fn cli_read_only_outputs_summary() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Duplicate scan summary"))
-        .stdout(predicates::str::contains("duplicates found"));
+        .stdout(predicates::str::contains("duplicate files"));
 }
 
 #[test]
@@ -37,10 +37,21 @@ fn cli_action_delete_force_removes_duplicate() {
     let duplicate_file = dir.join("file2.txt");
     assert!(duplicate_file.exists());
 
+    // Pin the neutral policy so the survivor is (root_index, path) and file2.txt
+    // is the deterministic victim. Bare `--no-protect` is today's neutral policy
+    // (empty protects + `lexical`); under the default convention `oldest` would
+    // otherwise decide between two files written back-to-back, which is timing-
+    // dependent on coarse-granularity filesystems.
     cargo_bin_cmd!("mddedupe")
         .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
         .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
-        .args([dir.to_str().unwrap(), "--action", "delete", "--force"])
+        .args([
+            dir.to_str().unwrap(),
+            "--action",
+            "delete",
+            "--force",
+            "--no-protect",
+        ])
         .assert()
         .success()
         .stdout(predicates::str::contains("Operation complete."));
@@ -128,18 +139,20 @@ fn cli_json_summary_outputs_valid_json() {
         1,
         "duplicate count should match"
     );
-    // Two-metric accounting (HLD §3.5): under the neutral default the removable
-    // metric equals the redundancy metric, so both new fields are present and
-    // mirror duplicate_files / duplicate_wasted_bytes.
+    // Two-metric accounting (HLD §3.5): this bare run uses the CONVENTION default
+    // (protect `0*`/`00-*`, `oldest` fallback), not the neutral default — but the
+    // `file*.txt` fixture matches no marker, so each group still has exactly one
+    // survivor and the removable metric equals the redundancy metric. Both new
+    // fields are present and mirror duplicate_files / duplicate_wasted_bytes.
     assert_eq!(
         summary["removable_files"].as_u64().unwrap(),
         1,
-        "removable_files should equal duplicate_files under the neutral default"
+        "removable_files should equal duplicate_files (no marker matches under the convention default)"
     );
     assert_eq!(
         summary["reclaimable_bytes"].as_u64().unwrap(),
         summary["duplicate_wasted_bytes"].as_u64().unwrap(),
-        "reclaimable_bytes should equal duplicate_wasted_bytes under the neutral default"
+        "reclaimable_bytes should equal duplicate_wasted_bytes (one survivor per group)"
     );
     assert_eq!(
         summary["summary_format"].as_str().unwrap(),
@@ -482,10 +495,19 @@ fn cli_variadic_positional_parses_when_interleaved_with_options() {
         let temp = create_duplicate_fixture();
         let dir = temp.path();
         let duplicate = dir.join("file2.txt");
+        // Neutral policy pinned so file2.txt is the deterministic victim (see
+        // cli_action_delete_force_removes_duplicate). Bare `--no-protect` is the
+        // neutral (lexical) policy.
         cargo_bin_cmd!("mddedupe")
             .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
             .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
-            .args([dir.to_str().unwrap(), "--action", "delete", "--force"])
+            .args([
+                dir.to_str().unwrap(),
+                "--action",
+                "delete",
+                "--force",
+                "--no-protect",
+            ])
             .assert()
             .success()
             .stdout(predicates::str::contains(dir.to_str().unwrap()));
@@ -600,4 +622,281 @@ fn cli_fail_on_error_sets_exit_status() {
     let stderr =
         String::from_utf8(assert.get_output().stderr.clone()).expect("stderr should be utf-8");
     assert!(stderr.contains("failures"));
+}
+
+// --- Stage 3: configurable survivor selection (via the binary) -------------
+
+/// Builds a fixture with a `00-*` master copy and a plain duplicate under a
+/// single scan root, both byte-identical. Returns the temp dir, the master path
+/// and the plain copy path. Used to exercise the protect rules end to end.
+fn create_protect_fixture() -> (assert_fs::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    let master = temp.child("00-master.txt");
+    let plain = temp.child("copy.txt");
+    master.write_str("shared content").expect("write master");
+    plain.write_str("shared content").expect("write plain");
+    (
+        temp,
+        master.path().to_path_buf(),
+        plain.path().to_path_buf(),
+    )
+}
+
+#[test]
+fn cli_default_convention_protects_master_copy() {
+    // A bare run (no config, no flags) uses the built-in convention default, so
+    // the `00-*` master is kept and the plain copy is the victim. Set the cwd to
+    // the (config-less) temp dir so the `./.mddedupe.toml` lookup is hermetic.
+    let (temp, master, plain) = create_protect_fixture();
+
+    cargo_bin_cmd!("mddedupe")
+        .current_dir(temp.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            temp.path().to_str().unwrap(),
+            "--action",
+            "delete",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "KEPT (protected: name 00-master.txt)",
+        ));
+
+    assert!(master.exists(), "00-* master must be protected and kept");
+    assert!(!plain.exists(), "plain copy must be deleted");
+}
+
+#[test]
+fn cli_default_oldest_keeps_oldest_over_lexical() {
+    // Pin survivor identity under the LIVE `oldest` default (no flags). The kept
+    // copy is the OLDEST but would NOT be chosen by `(root_index, path)`: the older
+    // file (`zzz.txt`) sorts LATER alphabetically than the newer (`aaa.txt`). A
+    // lexical/historical keeper would be `aaa.txt`; the convention default must keep
+    // the oldest, `zzz.txt`. mtimes are set explicitly so the strategy is
+    // deterministic on coarse-granularity filesystems. No fixture name matches the
+    // `0*`/`00-*` markers, so the fallback (`oldest`) genuinely decides.
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    let newer = temp.child("aaa.txt");
+    let older = temp.child("zzz.txt");
+    newer.write_str("shared content").expect("write newer");
+    older.write_str("shared content").expect("write older");
+    filetime::set_file_mtime(older.path(), filetime::FileTime::from_unix_time(1_000, 0))
+        .expect("set older mtime");
+    filetime::set_file_mtime(newer.path(), filetime::FileTime::from_unix_time(2_000, 0))
+        .expect("set newer mtime");
+
+    cargo_bin_cmd!("mddedupe")
+        .current_dir(temp.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            temp.path().to_str().unwrap(),
+            "--action",
+            "delete",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("KEPT (oldest)"));
+
+    assert!(
+        older.path().exists(),
+        "the oldest copy (zzz.txt) must survive under the live oldest default"
+    );
+    assert!(
+        !newer.path().exists(),
+        "the newer copy (aaa.txt) must be removed even though it sorts first lexically"
+    );
+}
+
+#[test]
+fn cli_no_protect_lexical_reverts_to_root_index() {
+    // Bare `--no-protect` IS today's exact neutral policy (HLD §3.3/§4.1): empty
+    // protects AND a `lexical` fallback — no `--keep lexical` needed. The survivor
+    // is the copy under the first-listed root, ties broken by path. The first root
+    // ("zzz_dir") sorts AFTER the second ("aaa_dir"), so a path-only sort would
+    // list aaa first; the (root_index, path) sort must list zzz first.
+    let parent = assert_fs::TempDir::new().expect("create parent");
+    let dir_zzz = parent.child("zzz_dir");
+    let dir_aaa = parent.child("aaa_dir");
+    dir_zzz.create_dir_all().expect("create zzz_dir");
+    dir_aaa.create_dir_all().expect("create aaa_dir");
+    dir_zzz
+        .child("copy.txt")
+        .write_str("shared content")
+        .expect("write zzz copy");
+    dir_aaa
+        .child("copy.txt")
+        .write_str("shared content")
+        .expect("write aaa copy");
+
+    let output = cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            dir_zzz.path().to_str().unwrap(),
+            dir_aaa.path().to_str().unwrap(),
+            "--no-protect",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("stdout should be valid UTF-8");
+    let group_start = stdout
+        .find("Duplicate group")
+        .expect("read-only listing should print a duplicate group");
+    let group_block = &stdout[group_start..];
+    // The neutral fallback survivor is labelled `KEPT (lexical)`.
+    assert!(
+        group_block.contains("KEPT (lexical)"),
+        "neutral fallback should be labelled lexical, got:\n{}",
+        group_block
+    );
+    let zzz_pos = group_block
+        .find(dir_zzz.path().to_str().unwrap())
+        .expect("zzz copy should appear");
+    let aaa_pos = group_block
+        .find(dir_aaa.path().to_str().unwrap())
+        .expect("aaa copy should appear");
+    assert!(
+        zzz_pos < aaa_pos,
+        "survivor under first-listed root (zzz_dir) should be listed first; \
+         group block:\n{}",
+        group_block
+    );
+}
+
+#[test]
+fn cli_protect_dir_via_flag_keeps_matching_dir() {
+    // `--protect-dir keepme*` protects the copy under a `keepme/` directory; the
+    // sibling plain copy is removed. `--no-protect` is NOT set, so the convention
+    // would also fire — but the flag replaces only the dir list, and neither
+    // copy name matches the default name globs, so the dir flag is what protects.
+    let parent = assert_fs::TempDir::new().expect("create parent");
+    let keepme = parent.child("keepme");
+    let plain = parent.child("plain");
+    keepme.create_dir_all().expect("create keepme");
+    plain.create_dir_all().expect("create plain");
+    let kept = keepme.child("x.txt");
+    let victim = plain.child("x.txt");
+    kept.write_str("shared content").expect("write kept");
+    victim.write_str("shared content").expect("write victim");
+
+    cargo_bin_cmd!("mddedupe")
+        .current_dir(parent.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            parent.path().to_str().unwrap(),
+            "--protect-dir",
+            "keepme*",
+            "--keep",
+            "lexical",
+            "--action",
+            "delete",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("KEPT (protected: dir keepme)"));
+
+    assert!(kept.path().exists(), "copy under keepme/ must be kept");
+    assert!(!victim.path().exists(), "plain copy must be deleted");
+}
+
+#[test]
+fn cli_protect_name_via_flag_keeps_matching_name() {
+    // `--protect-name master.*` protects the file named master.txt; the plain
+    // sibling is removed.
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    let master = temp.child("master.txt");
+    let plain = temp.child("copy.txt");
+    master.write_str("shared content").expect("write master");
+    plain.write_str("shared content").expect("write plain");
+
+    cargo_bin_cmd!("mddedupe")
+        .current_dir(temp.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            temp.path().to_str().unwrap(),
+            "--protect-name",
+            "master.*",
+            "--keep",
+            "lexical",
+            "--action",
+            "delete",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "KEPT (protected: name master.txt)",
+        ));
+
+    assert!(master.path().exists(), "master.txt must be kept");
+    assert!(!plain.path().exists(), "plain copy must be deleted");
+}
+
+#[test]
+fn cli_divergent_two_metric_summary() {
+    // Two protected copies (under `0*` dirs) + one plain copy in the SAME hash
+    // group: redundancy = 2 (len-1), removable = 1 (a single victim). The summary
+    // must report both metrics and the "protected and kept" count (HLD §3.5).
+    let parent = assert_fs::TempDir::new().expect("create parent");
+    let a = parent.child("00-a");
+    let b = parent.child("00-b");
+    let c = parent.child("plain");
+    a.create_dir_all().expect("create 00-a");
+    b.create_dir_all().expect("create 00-b");
+    c.create_dir_all().expect("create plain");
+    a.child("x.txt").write_str("shared").expect("write a");
+    b.child("x.txt").write_str("shared").expect("write b");
+    c.child("x.txt").write_str("shared").expect("write c");
+
+    cargo_bin_cmd!("mddedupe")
+        .current_dir(parent.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .arg(parent.path().to_str().unwrap())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("2 duplicate files"))
+        .stdout(predicates::str::contains("1 removable"))
+        .stdout(predicates::str::contains("1 protected and kept"));
+}
+
+#[test]
+fn cli_bad_config_path_exits_non_zero() {
+    let temp = create_duplicate_fixture();
+    cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            temp.path().to_str().unwrap(),
+            "--config",
+            "definitely-not-a-real-config-xyz.toml",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Failed to read config file"));
+}
+
+#[test]
+fn cli_bad_protect_glob_exits_non_zero() {
+    let temp = create_duplicate_fixture();
+    cargo_bin_cmd!("mddedupe")
+        .current_dir(temp.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([temp.path().to_str().unwrap(), "--protect-dir", "["])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Invalid protect glob"));
 }

@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -43,7 +43,8 @@ fn survivor_cmp(a: &DuplicateEntry, b: &DuplicateEntry) -> std::cmp::Ordering {
 /// Tie-break strategy used to pick the survivor of an unprotected duplicate group
 /// (i.e. when no copy is protected). Sits between `root_index` and the final
 /// `path` tiebreak in the fallback chain (HLD §3.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum FallbackStrategy {
     /// Keep the copy with the earliest modification time.
     Oldest,
@@ -90,16 +91,30 @@ enum SurvivorReason {
     Fallback,
 }
 
-/// Compiles a list of glob patterns into a `GlobSet`, matching each pattern
-/// case-insensitively. Used by tests now and by config/CLI policy resolution in
-/// a later stage (hence `allow(dead_code)` until that call site lands).
-#[allow(dead_code)]
-fn build_globset(patterns: &[String]) -> Result<GlobSet, globset::Error> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(GlobBuilder::new(pattern).case_insensitive(true).build()?);
-    }
-    builder.build()
+/// Built-in convention default (HLD §3.3/§4.2): a bare `mddedupe <dir>` with no
+/// config and no flags protects `0*` directories and `00-*` / `00 - *` filenames
+/// and falls back to `oldest`. Defined once here so config/CLI resolution and any
+/// "use the default for this field" branch share a single source.
+const DEFAULT_PROTECT_DIR: &[&str] = &["0*"];
+const DEFAULT_PROTECT_NAME: &[&str] = &["00-*", "00 - *"];
+const DEFAULT_FALLBACK: FallbackStrategy = FallbackStrategy::Oldest;
+
+/// Parsed `.mddedupe.toml` (HLD §5.8). `deny_unknown_fields` turns typos into
+/// fatal errors rather than silent no-ops.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct ConfigFile {
+    keep: Option<KeepConfig>,
+}
+
+/// The `[keep]` table. `Option<Vec<_>>` distinguishes "field omitted" (use the
+/// built-in default list) from "field set to `[]`" (explicitly empty).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct KeepConfig {
+    protect_dir: Option<Vec<String>>,
+    protect_name: Option<Vec<String>>,
+    fallback: Option<FallbackStrategy>,
 }
 
 /// Reads a path's modification time, or `None` if it cannot be read. An
@@ -142,6 +157,54 @@ fn protect_reason(entry: &DuplicateEntry, policy: &KeepPolicy) -> Option<Survivo
         Some(SurvivorReason::ProtectedName)
     } else {
         None
+    }
+}
+
+/// The human-readable name of a fallback strategy, used in the explain label.
+fn fallback_label(strategy: FallbackStrategy) -> &'static str {
+    match strategy {
+        FallbackStrategy::Oldest => "oldest",
+        FallbackStrategy::Newest => "newest",
+        FallbackStrategy::Shortest => "shortest",
+        FallbackStrategy::Lexical => "lexical",
+    }
+}
+
+/// Builds the `KEPT (...)` explain reason for a survivor (HLD §4.3). For a
+/// protected file the matched marker (the ancestor directory name or the file
+/// name that triggered the rule) is named so the user can see *why* it was kept;
+/// for a fallback survivor the strategy name is shown.
+fn survivor_reason_label(
+    entry: &DuplicateEntry,
+    reason: SurvivorReason,
+    policy: &KeepPolicy,
+) -> String {
+    let path = entry.0.as_path();
+    match reason {
+        SurvivorReason::ProtectedDir => {
+            // Walk ancestors from the file UPWARD and name the NEAREST matching
+            // directory (CR N1). This answers "which directory protected THIS file"
+            // most usefully; if several ancestors match (e.g. `0root/00-sub/x`) the
+            // closest one (`00-sub`) is shown. The HLD does not pin near-vs-far, so
+            // nearest is the deliberate UX choice.
+            let marker = path
+                .components()
+                .rev()
+                .skip(1) // skip the file name itself
+                .map(|c| c.as_os_str().to_string_lossy())
+                .find(|name| policy.protect_dir.is_match(name.as_ref()))
+                .map(|name| name.into_owned())
+                .unwrap_or_default();
+            format!("KEPT (protected: dir {})", marker)
+        }
+        SurvivorReason::ProtectedName => {
+            let marker = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            format!("KEPT (protected: name {})", marker)
+        }
+        SurvivorReason::Fallback => format!("KEPT ({})", fallback_label(policy.fallback)),
     }
 }
 
@@ -203,6 +266,49 @@ fn select_survivors<'a>(
     let mut victims: Vec<&DuplicateEntry> = keyed.into_iter().map(|(_, entry)| entry).collect();
     let keeper = victims.remove(0);
     (vec![(keeper, SurvivorReason::Fallback)], victims)
+}
+
+/// A duplicate group's resolved survivor/victim partition, computed exactly ONCE
+/// per run via [`select_survivors`] and then reused by every consumer: the
+/// removable two-metric accounting, the read-only display listing, and the action
+/// loop in [`process_duplicates`]. Building it once is the single source of truth
+/// that makes the displayed `KEPT` file, the file actually acted on, and the
+/// removable counts provably reference the SAME entries — they cannot diverge from
+/// independent re-evaluations (which, for the `oldest`/`newest` strategies, could
+/// otherwise read a changed mtime and elect a different survivor).
+struct GroupPlan<'a> {
+    hash: &'a str,
+    survivors: Vec<(&'a DuplicateEntry, SurvivorReason)>,
+    victims: Vec<&'a DuplicateEntry>,
+}
+
+impl GroupPlan<'_> {
+    /// Total size of this group's victims (the bytes this run would reclaim).
+    fn victim_bytes(&self) -> u64 {
+        self.victims.iter().map(|(_, size, _)| *size).sum()
+    }
+}
+
+/// Builds one [`GroupPlan`] per duplicate group (groups with `len > 1`), calling
+/// [`select_survivors`] exactly once per group. All downstream consumers read
+/// these stored plans rather than re-partitioning, so the listing, the action,
+/// and the metrics always agree (see [`GroupPlan`]).
+fn build_group_plans<'a>(
+    duplicates: &'a HashMap<String, Vec<DuplicateEntry>>,
+    policy: &KeepPolicy,
+) -> Vec<GroupPlan<'a>> {
+    duplicates
+        .iter()
+        .filter(|(_, group)| group.len() > 1)
+        .map(|(hash, group)| {
+            let (survivors, victims) = select_survivors(group, policy);
+            GroupPlan {
+                hash,
+                survivors,
+                victims,
+            }
+        })
+        .collect()
 }
 
 /// The fallback chain comparator (HLD §3.1): `root_index → strategy key → path`.
@@ -314,6 +420,26 @@ struct Args {
     /// Treat per-file action failures as fatal and return a non-zero exit code when any occur.
     #[arg(long)]
     fail_on_error: bool,
+
+    /// Protect files under a directory whose name matches this glob (repeatable). Replaces the config/default dir list.
+    #[arg(long)]
+    protect_dir: Vec<String>,
+
+    /// Protect files whose own name matches this glob (repeatable). Replaces the config/default name list.
+    #[arg(long)]
+    protect_name: Vec<String>,
+
+    /// Disable all protect rules for this run (neutral policy).
+    #[arg(long, conflicts_with_all = ["protect_dir", "protect_name"])]
+    no_protect: bool,
+
+    /// Fallback strategy used to pick the survivor of an unprotected group.
+    #[arg(long, value_enum)]
+    keep: Option<FallbackStrategy>,
+
+    /// Explicit path to a `.mddedupe.toml` config file.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 /// Converts a file size in bytes to a human‐readable string with appropriate units.
@@ -670,11 +796,11 @@ fn collapse_group_by_identity(group: &mut Vec<DuplicateEntry>, policy: &KeepPoli
     *group = distinct;
 }
 
-/// The result of a duplicate scan, carrying both accounting metrics (HLD §3.5):
-/// *redundancy* ("how much duplication exists", `len-1` per group — unchanged
-/// meaning) and *removable* ("what this run would actually remove", the victim
-/// count from `select_survivors` under the active policy). The two coincide under
-/// a neutral policy (always one survivor per group).
+/// The result of a duplicate scan. Carries the *redundancy* metric ("how much
+/// duplication exists", `len-1` per group — unchanged meaning) directly; the
+/// *removable* metric ("what this run would actually remove") is derived in
+/// `run_app` from the per-group `GroupPlan` partitions so it shares the exact
+/// survivor/victim split used for display and action (HLD §3.5).
 struct DuplicateScan {
     /// Map from hash to a vector of (file path, file size, root index).
     duplicates: HashMap<String, Vec<DuplicateEntry>>,
@@ -684,10 +810,6 @@ struct DuplicateScan {
     redundant_files: usize,
     /// Redundancy bytes: sizes of the `len-1` redundant copies per group.
     redundant_bytes: u64,
-    /// Removable count: `Σ select_survivors(group, policy).victims.len()`.
-    removable_files: usize,
-    /// Reclaimable bytes: summed sizes of the victims per group.
-    reclaimable_bytes: u64,
     /// Elapsed scan time.
     elapsed: Duration,
 }
@@ -924,20 +1046,15 @@ fn find_duplicates_in_dirs(
 
     duplicates.retain(|_, group| group.len() > 1);
 
-    // Two-metric accounting (HLD §3.5/§5.5). Redundancy is the `len-1` formula
-    // (unchanged meaning); removable counts the actual victims under the policy.
-    // Under a neutral policy each group has exactly one survivor, so the two pairs
-    // are identical.
+    // Redundancy accounting (HLD §3.5/§5.5): the `len-1` formula (unchanged
+    // meaning). The removable metric is NOT computed here — it is derived from the
+    // single per-group `GroupPlan` partition built once in `run_app`, so the
+    // removable count and the acted-on victim set can never drift.
     let mut redundant_files = 0;
     let mut redundant_bytes = 0;
-    let mut removable_files = 0;
-    let mut reclaimable_bytes = 0;
     for group in duplicates.values() {
         redundant_files += group.len() - 1;
         redundant_bytes += group.iter().skip(1).map(|(_, size, _)| *size).sum::<u64>();
-        let (_survivors, victims) = select_survivors(group, policy);
-        removable_files += victims.len();
-        reclaimable_bytes += victims.iter().map(|(_, size, _)| *size).sum::<u64>();
     }
     let elapsed = start.elapsed();
     Ok(DuplicateScan {
@@ -945,8 +1062,6 @@ fn find_duplicates_in_dirs(
         scanned_files,
         redundant_files,
         redundant_bytes,
-        removable_files,
-        reclaimable_bytes,
         elapsed,
     })
 }
@@ -987,6 +1102,26 @@ enum DuplicateAction {
     Move(PathBuf),
     Trash,
     Delete,
+}
+
+/// The verb shown next to a victim in the explain output (HLD §4.3).
+fn action_label(action: &DuplicateAction) -> &'static str {
+    match action {
+        DuplicateAction::Move(_) => "move",
+        DuplicateAction::Trash => "trash",
+        DuplicateAction::Delete => "delete",
+    }
+}
+
+/// The verb previewed next to a victim in the read-only listing: what *would*
+/// happen this run. Delegates to [`action_label`] when an action is requested so
+/// the previewed and executed verbs share one source; with no action the generic
+/// "remove" is shown (HLD §4.3).
+fn would_verb(action: Option<&DuplicateAction>) -> &'static str {
+    match action {
+        Some(action) => action_label(action),
+        None => "remove",
+    }
 }
 
 #[derive(Copy, Clone, Debug, Serialize, ValueEnum, PartialEq, Eq)]
@@ -1288,6 +1423,12 @@ enum AppError {
     UnknownAction(String),
     ActionFailures(usize),
     OverlappingPaths(PathBuf, PathBuf),
+    /// `--config <path>` was given but the file is missing or unreadable.
+    ConfigUnreadable(PathBuf, io::Error),
+    /// A config file was found but failed to parse (bad TOML or unknown field).
+    ConfigParse(PathBuf, String),
+    /// A protect glob (from a flag or config) failed to compile.
+    InvalidGlob(String, String),
 }
 
 impl From<io::Error> for AppError {
@@ -1300,63 +1441,59 @@ impl From<io::Error> for AppError {
     }
 }
 
-/// Processes duplicates by applying the selected action to every file in each duplicate group except the first.
-/// For each file processed, updated status information is printed and aggregated into a report.
+/// Processes duplicates by applying the selected action to the victims of each
+/// duplicate group, as decided once by `select_survivors` under the active policy
+/// and carried in the supplied [`GroupPlan`]s (the survivors are retained). The
+/// plans are the same partitions used for the read-only listing and the removable
+/// metric, so the displayed `KEPT` file and the file acted on are guaranteed
+/// identical. For each file processed, updated status information is printed and
+/// aggregated into a report.
 fn process_duplicates(
-    duplicates: &HashMap<String, Vec<DuplicateEntry>>,
+    plans: &[GroupPlan],
     action: &DuplicateAction,
     policy: &KeepPolicy,
     info_logs: bool,
     error_logs: bool,
 ) -> ProcessReport {
-    // Removable total: the number of files this run will actually act on, summed
-    // across groups as the victim count from the shared selection engine (HLD
-    // §3.5/§5.5). Under the neutral default this equals the old Σ(len-1) formula
-    // (exactly one survivor per group); a protect policy can keep >1 survivor (or
-    // all copies), so the count must come from `select_survivors`, not `len-1`.
-    let overall_total: usize = duplicates
-        .values()
-        .filter(|v| v.len() > 1)
-        .map(|v| select_survivors(v, policy).1.len())
-        .sum();
+    // The removable total is the sum of victims across the prebuilt plans, so it
+    // matches the acted-on set exactly (no separate counting pass).
+    let overall_total: usize = plans.iter().map(|plan| plan.victims.len()).sum();
     let mut report = ProcessReport::new(overall_total);
 
-    for (hash, files) in duplicates {
-        if files.len() <= 1 {
-            continue;
-        }
-        // Partition the group via the shared selection engine: survivors are kept,
-        // victims are acted on. Under the neutral default this is exactly the old
-        // `survivor_cmp`-first survivor + `skip(1)` victims.
-        let (survivors, victims) = select_survivors(files, policy);
+    for plan in plans {
+        let GroupPlan {
+            hash,
+            survivors,
+            victims,
+        } = plan;
         if info_logs {
             println!(
                 "{}",
                 ansi_fixed(8, format!("Duplicate group (hash: {}):", hash))
             );
-            let mut index = 1;
-            for ((path, size, _), _reason) in &survivors {
+            // Survivors first, each tagged with its KEPT reason; then victims
+            // tagged with the action that will be applied (HLD §4.3).
+            for (entry, reason) in survivors {
+                let (path, size, _) = entry;
                 println!(
-                    "  {}: {} ({})",
-                    index,
+                    "  {} ({}) -> {}",
                     path.display(),
-                    human_readable(*size)
+                    human_readable(*size),
+                    survivor_reason_label(entry, *reason, policy)
                 );
-                index += 1;
             }
-            for (path, size, _) in &victims {
+            for (path, size, _) in victims {
                 println!(
-                    "  {}: {} ({})",
-                    index,
+                    "  {} ({}) -> {}",
                     path.display(),
-                    human_readable(*size)
+                    human_readable(*size),
+                    action_label(action)
                 );
-                index += 1;
             }
         }
 
         // Act on the victims (the survivors are retained).
-        for (path, size, _) in &victims {
+        for (path, size, _) in victims {
             if cancellation_requested() {
                 return report;
             }
@@ -1434,8 +1571,10 @@ fn format_scan_summary(
     elapsed: Duration,
 ) -> String {
     if removable_files == redundant_files {
+        // Same "duplicate files" wording as the divergent branch below, so logs
+        // that mix both formats read consistently (CR N3).
         format!(
-            "{} files scanned, {} duplicates found ({} wasted) in {}.",
+            "{} files scanned, {} duplicate files ({} wasted) in {}.",
             scanned,
             redundant_files,
             human_readable(redundant_bytes),
@@ -1459,6 +1598,113 @@ fn format_scan_summary(
     }
 }
 
+/// Loads the config file that governs this run, if any (HLD §4.2 resolution
+/// order): an explicit `--config <path>` (fatal if missing/unreadable/malformed),
+/// else `<base_dir>/.mddedupe.toml` if it exists, else `None`.
+///
+/// `base_dir` is the directory the auto-discovery lookup is resolved against. The
+/// CLI passes `.` (the process current directory, matching HLD §4.2); tests inject
+/// a controlled temp directory so the lookup never depends on the process CWD.
+fn load_config(args: &Args, base_dir: &Path) -> Result<Option<KeepConfig>, AppError> {
+    let path = match &args.config {
+        Some(path) => path.clone(),
+        None => {
+            let default = base_dir.join(".mddedupe.toml");
+            if !default.exists() {
+                return Ok(None);
+            }
+            default
+        }
+    };
+    let contents =
+        fs::read_to_string(&path).map_err(|err| AppError::ConfigUnreadable(path.clone(), err))?;
+    let config: ConfigFile =
+        toml::from_str(&contents).map_err(|err| AppError::ConfigParse(path, err.to_string()))?;
+    Ok(config.keep)
+}
+
+/// Compiles a list of glob patterns into a `GlobSet`, mapping a bad glob to a
+/// fatal `AppError` that names the offending pattern (HLD §5.4). Each pattern is
+/// built individually and the FIRST that fails is surfaced directly, so the
+/// offending pattern name is always the real one (no re-scan, and no empty-string
+/// fallback from a hypothetical `GlobSetBuilder::build()` failure).
+fn compile_protect(patterns: &[String]) -> Result<GlobSet, AppError> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = GlobBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .map_err(|err| AppError::InvalidGlob(pattern.clone(), err.to_string()))?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .map_err(|err| AppError::InvalidGlob(String::new(), err.to_string()))
+}
+
+/// Resolves the active [`KeepPolicy`] from CLI flags and an optional config file
+/// (HLD §4.2/§5.4). `base_dir` is the directory `./.mddedupe.toml` auto-discovery
+/// is resolved against (see [`load_config`]). Per-field merge (flags win):
+///
+/// - protect lists: `--no-protect` forces both empty; else a passed
+///   `--protect-dir`/`--protect-name` replaces the list; else the config list
+///   (when the field is present); else the built-in convention default list.
+/// - fallback: `--keep` if passed; else (only when `--no-protect` is NOT set) the
+///   config `fallback`; else `--no-protect` ⇒ `lexical`, otherwise the built-in
+///   default (`oldest`).
+///
+/// `--no-protect` selects the **neutral policy** = today's exact pre-Stage-3
+/// behavior (HLD §3.3/§4.1): empty protect lists AND a `lexical` fallback (so the
+/// survivor is the plain `(root_index, path)` winner). An explicit `--keep` still
+/// wins over that neutral fallback — e.g. `--no-protect --keep oldest` clears
+/// protects but keeps the oldest copy.
+fn resolve_keep_policy(args: &Args, base_dir: &Path) -> Result<KeepPolicy, AppError> {
+    let config = load_config(args, base_dir)?;
+
+    let default_dir: Vec<String> = DEFAULT_PROTECT_DIR.iter().map(|s| s.to_string()).collect();
+    let default_name: Vec<String> = DEFAULT_PROTECT_NAME.iter().map(|s| s.to_string()).collect();
+
+    let (protect_dir, protect_name) = if args.no_protect {
+        (Vec::new(), Vec::new())
+    } else {
+        // A passed repeatable flag is non-empty; an absent one is an empty Vec.
+        let dir = if !args.protect_dir.is_empty() {
+            args.protect_dir.clone()
+        } else {
+            match config.as_ref().and_then(|c| c.protect_dir.clone()) {
+                Some(list) => list,
+                None => default_dir,
+            }
+        };
+        let name = if !args.protect_name.is_empty() {
+            args.protect_name.clone()
+        } else {
+            match config.as_ref().and_then(|c| c.protect_name.clone()) {
+                Some(list) => list,
+                None => default_name,
+            }
+        };
+        (dir, name)
+    };
+
+    // `--no-protect` means "today's neutral behavior", which is `lexical`. An
+    // explicit `--keep` overrides it; the config fallback is ignored under
+    // `--no-protect` (the whole point is to opt out of the policy, not inherit it).
+    let fallback = if args.no_protect {
+        args.keep.unwrap_or(FallbackStrategy::Lexical)
+    } else {
+        args.keep
+            .or_else(|| config.as_ref().and_then(|c| c.fallback))
+            .unwrap_or(DEFAULT_FALLBACK)
+    };
+
+    Ok(KeepPolicy {
+        protect_dir: compile_protect(&protect_dir)?,
+        protect_name: compile_protect(&protect_name)?,
+        fallback,
+    })
+}
+
 fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
     install_ctrlc_handler()?;
     reset_cancellation_flag();
@@ -1470,9 +1716,13 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         return Err(AppError::OverlappingPaths(outer, inner));
     }
 
-    // Stage 1: neutral selection policy (today's behavior). Config/CLI resolution
-    // arrives in a later stage; the engine already supports protect rules.
-    let keep_policy = KeepPolicy::default();
+    // Resolve the survivor-selection policy from config + CLI flags (HLD §5.4).
+    // With no config and no flags this is the built-in convention default
+    // (protect `0*` dirs and `00-*` / `00 - *` names, `oldest` fallback), NOT the
+    // neutral type default. A bad config or glob is fatal before any scan.
+    // `./.mddedupe.toml` auto-discovery is resolved against the process current
+    // directory (HLD §4.2).
+    let keep_policy = resolve_keep_policy(&args, Path::new("."))?;
 
     let summary_stdout = args.summary_format == SummaryFormat::Text && !args.summary_silent;
     let log_output = !args.summary_only && !args.quiet && matches!(args.log_level, LogLevel::Info);
@@ -1492,13 +1742,17 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         return Err(AppError::CreateDestRequiresMove);
     }
 
-    let mut move_destination: Option<PathBuf> = None;
     let mut json_action_report: Option<ProcessReport> = None;
     let mut json_summary_output: Option<String> = None;
-    if let Some(action_str) = args.action.as_deref() {
-        if action_str.eq_ignore_ascii_case("move") {
+    // Parse the requested action ONCE, up front, into a `DuplicateAction`. Both the
+    // read-only listing (`would_verb`) and the action loop derive their verb from
+    // this single value via `action_label`, so the previewed and executed verbs can
+    // never diverge. Failing fast also avoids scanning under an unknown action or a
+    // missing/invalid move destination.
+    let action: Option<DuplicateAction> = match args.action.as_deref() {
+        None => None,
+        Some(action_str) if action_str.eq_ignore_ascii_case("move") => {
             let dest_path = args.dest.clone().ok_or(AppError::MissingMoveDestination)?;
-
             if dest_path.exists() {
                 if !dest_path.is_dir() {
                     return Err(AppError::MoveDestinationNotDirectory(dest_path));
@@ -1509,12 +1763,12 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
             } else {
                 return Err(AppError::MoveDestinationMissing(dest_path));
             }
-
-            move_destination = Some(dest_path);
+            Some(DuplicateAction::Move(dest_path))
         }
-    } else if args.create_dest {
-        return Err(AppError::CreateDestRequiresMove);
-    }
+        Some(s) if s.eq_ignore_ascii_case("trash") => Some(DuplicateAction::Trash),
+        Some(s) if s.eq_ignore_ascii_case("delete") => Some(DuplicateAction::Delete),
+        Some(other) => return Err(AppError::UnknownAction(other.to_string())),
+    };
 
     if summary_stdout {
         let joined = args
@@ -1531,8 +1785,6 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         scanned_files: scanned,
         redundant_files: duplicate_count,
         redundant_bytes: wasted,
-        removable_files,
-        reclaimable_bytes,
         elapsed,
     } = find_duplicates_in_dirs(
         &args.directories,
@@ -1551,39 +1803,57 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         );
     }
 
+    // Build each group's survivor/victim partition EXACTLY ONCE here (HLD §5.5).
+    // The same `plans` drive the removable two-metric accounting, the read-only
+    // listing below, and the action loop in `process_duplicates`, so the displayed
+    // `KEPT` file, the file acted on, and the removable counts always reference the
+    // identical survivors/victims — they cannot diverge from independent
+    // re-evaluations (which could otherwise read a changed mtime under
+    // `oldest`/`newest` and elect a different survivor).
+    let mut plans = build_group_plans(&duplicates, &keep_policy);
+    // List groups by the bytes they would actually reclaim (the victim bytes from
+    // the stored plan), so the listing order matches what would be removed.
+    plans.sort_by_key(|plan| plan.victim_bytes());
+    let removable_files: usize = plans.iter().map(|plan| plan.victims.len()).sum();
+    let reclaimable_bytes: u64 = plans.iter().map(|plan| plan.victim_bytes()).sum();
+
     if log_output {
-        let mut groups: Vec<(&String, &Vec<DuplicateEntry>)> = duplicates
-            .iter()
-            .filter(|(_, group)| group.len() > 1)
-            .collect();
-        // Sort by the actual reclaimable (victim) bytes under the active policy so
-        // the listing order matches what would be removed, not a `skip(1)`
-        // approximation of the raw group. Under the neutral default this is the
-        // same ordering as before (one survivor per group).
-        groups.sort_by_key(|(_, group)| {
-            let (_survivors, victims) = select_survivors(group, &keep_policy);
-            victims.iter().map(|(_, size, _)| *size).sum::<u64>()
-        });
-        for (hash, group) in groups {
+        // The verb shown for victims: what *would* happen this run, derived from
+        // the single parsed action (HLD §4.3).
+        let preview_verb = would_verb(action.as_ref());
+        for plan in &plans {
             println!(
                 "{}",
-                ansi_fixed(8, format!("Duplicate group (hash: {}):", hash))
+                ansi_fixed(8, format!("Duplicate group (hash: {}):", plan.hash))
             );
-            // Print survivors first, then victims, using the shared selection
-            // engine so the displayed and executed decisions can never drift.
-            let (survivors, victims) = select_survivors(group, &keep_policy);
-            for ((path, size, _), _reason) in &survivors {
-                println!("  {} ({})", path.display(), human_readable(*size));
+            // Print survivors first (each tagged with its KEPT reason), then
+            // victims (tagged with what would happen), from the stored plan so the
+            // displayed and executed decisions can never drift.
+            for (entry, reason) in &plan.survivors {
+                let (path, size, _) = entry;
+                println!(
+                    "  {} ({}) -> {}",
+                    path.display(),
+                    human_readable(*size),
+                    survivor_reason_label(entry, *reason, &keep_policy)
+                );
             }
-            for (path, size, _) in &victims {
-                println!("  {} ({})", path.display(), human_readable(*size));
+            for (path, size, _) in &plan.victims {
+                println!(
+                    "  {} ({}) -> {}",
+                    path.display(),
+                    human_readable(*size),
+                    preview_verb
+                );
             }
         }
         println!();
     }
 
-    // Two-metric summary (HLD §3.5). Under the Stage 2 neutral default the metrics
-    // coincide, so the divergent branch is only reached by unit tests, never the CLI.
+    // Two-metric summary (HLD §3.5). Under a neutral policy (≤1 survivor per group)
+    // the metrics coincide and the wording is unchanged; under the live convention
+    // default a real `0*`/`00-*` tree protects extra survivors and the divergent
+    // branch IS reached from the CLI (see `cli_divergent_two_metric_summary`).
     let summary_detail = format_scan_summary(
         scanned,
         duplicate_count,
@@ -1602,26 +1872,13 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         );
     }
 
-    let selected_action = args.action.as_ref().map(|value| value.to_lowercase());
     let action_kind = if args.summary_format == SummaryFormat::Json {
-        selected_action.clone()
+        action.as_ref().map(|a| action_label(a).to_string())
     } else {
         None
     };
 
-    if let Some(action_str) = selected_action {
-        let action = match action_str.as_str() {
-            "move" => {
-                let dest = move_destination
-                    .clone()
-                    .ok_or(AppError::MissingMoveDestination)?;
-                DuplicateAction::Move(dest)
-            }
-            "trash" => DuplicateAction::Trash,
-            "delete" => DuplicateAction::Delete,
-            other => return Err(AppError::UnknownAction(other.to_string())),
-        };
-
+    if let Some(action) = action {
         if !args.force {
             print!(
                 "WARNING: This action will modify the filesystem. Do you wish to proceed? (y/N): "
@@ -1635,7 +1892,7 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
             }
         }
 
-        let report = process_duplicates(&duplicates, &action, &keep_policy, log_output, error_logs);
+        let report = process_duplicates(&plans, &action, &keep_policy, log_output, error_logs);
 
         if cancellation_requested() {
             return Err(AppError::Cancelled);
@@ -1812,6 +2069,17 @@ fn format_app_error(err: &AppError) -> Option<(String, i32)> {
             ),
             1,
         )),
+        AppError::ConfigUnreadable(path, err) => Some((
+            format!("Failed to read config file {}: {}", path.display(), err),
+            1,
+        )),
+        AppError::ConfigParse(path, err) => Some((
+            format!("Failed to parse config file {}: {}", path.display(), err),
+            1,
+        )),
+        AppError::InvalidGlob(pattern, err) => {
+            Some((format!("Invalid protect glob '{}': {}", pattern, err), 1))
+        }
     }
 }
 
@@ -2326,6 +2594,11 @@ mod tests {
             log_level: LogLevel::None,
             summary_format: SummaryFormat::Text,
             fail_on_error: true,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2431,7 +2704,7 @@ mod tests {
         );
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Move(dest_dir.clone()),
             &KeepPolicy::default(),
             true,
@@ -2552,6 +2825,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2602,6 +2880,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(b"n\n".to_vec()));
@@ -2635,6 +2918,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2679,6 +2967,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2736,6 +3029,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2768,6 +3066,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2800,6 +3103,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let trash_dir = TempDir::new().expect("Failed to create trash directory");
@@ -2843,6 +3151,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2872,6 +3185,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2904,6 +3222,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2934,6 +3257,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Json,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2967,6 +3295,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -2996,6 +3329,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(b"y\n".to_vec()));
@@ -3033,6 +3371,11 @@ mod tests {
             log_level: LogLevel::Warn,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -3151,7 +3494,7 @@ mod tests {
         );
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Delete,
             &KeepPolicy::default(),
             true,
@@ -3207,7 +3550,7 @@ mod tests {
         );
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Move(move_dest_path.clone()),
             &KeepPolicy::default(),
             true,
@@ -3266,7 +3609,7 @@ mod tests {
         env::set_var("MDD_TRASH_DIR", &trash_path);
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Trash,
             &KeepPolicy::default(),
             true,
@@ -3327,7 +3670,7 @@ mod tests {
         fs::set_permissions(dest_path, perms).expect("Failed to restrict destination permissions");
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Move(dest_path.to_path_buf()),
             &KeepPolicy::default(),
             true,
@@ -3361,7 +3704,7 @@ mod tests {
         );
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Delete,
             &KeepPolicy::default(),
             true,
@@ -3641,6 +3984,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
         let result = run_app(args, Cursor::new(Vec::new()));
         assert!(result.is_ok(), "delete run should succeed: {result:?}");
@@ -3697,6 +4045,11 @@ mod tests {
             log_level: LogLevel::Info,
             summary_format: SummaryFormat::Text,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
         let result = run_app(args, Cursor::new(Vec::new()));
         assert!(result.is_ok(), "delete run should succeed: {result:?}");
@@ -3746,6 +4099,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -3780,6 +4138,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -3809,6 +4172,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -3839,6 +4207,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -3870,6 +4243,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -3921,6 +4299,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -3992,6 +4375,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4042,6 +4430,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Warn, // Warn level to trigger warn_logs
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4073,7 +4466,7 @@ mod tests {
         );
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Move(dest_dir.clone()),
             &KeepPolicy::default(),
             false, // info_logs = false
@@ -4187,6 +4580,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Error,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4216,6 +4614,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4245,6 +4648,11 @@ mod tests {
             summary_only: true, // summary_only mode
             log_level: LogLevel::Info,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4304,6 +4712,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4335,6 +4748,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4374,6 +4792,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4449,7 +4872,7 @@ mod tests {
         );
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Delete,
             &KeepPolicy::default(),
             true, // info_logs = true
@@ -4503,6 +4926,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         // User confirms with "y"
@@ -4630,6 +5058,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4661,6 +5094,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4741,6 +5179,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info, // Info level for logging
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4774,6 +5217,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4803,6 +5251,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4853,6 +5306,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Warn,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4903,6 +5361,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4941,6 +5404,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -4978,6 +5446,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5009,7 +5482,7 @@ mod tests {
         );
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Move(dest.path().to_path_buf()),
             &KeepPolicy::default(),
             false,
@@ -5046,6 +5519,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5079,6 +5557,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5112,6 +5595,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::Info,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5174,6 +5662,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5200,7 +5693,7 @@ mod tests {
         );
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Move(dest.path().to_path_buf()),
             &KeepPolicy::default(),
             true, // info_logs = true
@@ -5232,7 +5725,7 @@ mod tests {
         );
 
         let report = process_duplicates(
-            &duplicates,
+            &build_group_plans(&duplicates, &KeepPolicy::default()),
             &DuplicateAction::Trash,
             &KeepPolicy::default(),
             true, // info_logs = true
@@ -5393,6 +5886,60 @@ mod tests {
         let (msg, code) = result.unwrap();
         assert!(msg.contains("5 action failures"));
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn test_format_app_error_config_unreadable() {
+        let path = PathBuf::from("/some/config.toml");
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "no such file");
+        let err = AppError::ConfigUnreadable(path.clone(), io_err);
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(
+            msg.contains("config.toml"),
+            "message should name the config path"
+        );
+        assert!(
+            msg.contains("no such file"),
+            "message should include the io error"
+        );
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_config_parse() {
+        let path = PathBuf::from("/some/config.toml");
+        let err = AppError::ConfigParse(path.clone(), "unexpected key `oops`".to_string());
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(
+            msg.contains("config.toml"),
+            "message should name the config path"
+        );
+        assert!(
+            msg.contains("unexpected key"),
+            "message should include the parse error"
+        );
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn test_format_app_error_invalid_glob() {
+        let err = AppError::InvalidGlob("**[bad".to_string(), "invalid glob pattern".to_string());
+        let result = format_app_error(&err);
+        assert!(result.is_some());
+        let (msg, code) = result.unwrap();
+        assert!(
+            msg.contains("**[bad"),
+            "message should name the offending pattern"
+        );
+        assert!(
+            msg.contains("invalid glob"),
+            "message should include the error detail"
+        );
+        assert_eq!(code, 1);
     }
 
     #[test]
@@ -5578,6 +6125,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5624,6 +6176,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5669,6 +6226,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5727,6 +6289,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5783,6 +6350,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5940,6 +6512,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -5975,6 +6552,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -6016,6 +6598,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -6078,6 +6665,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
         let result = run_app(args, Cursor::new(Vec::new()));
         assert!(result.is_ok(), "scan should succeed, got: {:?}", result);
@@ -6136,6 +6728,11 @@ mod tests {
             summary_only: false,
             log_level: LogLevel::None,
             fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
         };
 
         let result = run_app(args, Cursor::new(Vec::new()));
@@ -6174,8 +6771,8 @@ mod tests {
     fn policy_with(dir: &[&str], name: &[&str], fallback: FallbackStrategy) -> KeepPolicy {
         let to_vec = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         KeepPolicy {
-            protect_dir: build_globset(&to_vec(dir)).expect("dir globset"),
-            protect_name: build_globset(&to_vec(name)).expect("name globset"),
+            protect_dir: compile_protect(&to_vec(dir)).expect("dir globset"),
+            protect_name: compile_protect(&to_vec(name)).expect("name globset"),
             fallback,
         }
     }
@@ -6451,6 +7048,71 @@ mod tests {
         assert_eq!(victim_paths(&victims), vec![middle, newest]);
     }
 
+    #[test]
+    fn test_group_plan_display_action_metrics_agree_under_oldest() {
+        // The core Stage 3 invariant (CR S1 / DA #2): the file shown KEPT, the file
+        // actually acted on, and the removable accounting must all reference the
+        // SAME survivor/victims. We construct a no-protect group where `oldest` and
+        // the `(root_index, path)` lexical order DISAGREE: the oldest file
+        // (`zzz.txt`) sorts LAST lexically, while the newer file (`aaa.txt`) sorts
+        // first. A lexical/`survivor_cmp` keeper would be `aaa.txt`; `oldest` must
+        // keep `zzz.txt`. Building the plan ONCE and driving display + action +
+        // metrics from it guarantees they cannot diverge.
+        // The structural guarantee against display/action divergence is the
+        // `process_duplicates(&[GroupPlan])` signature (a single shared partition);
+        // this test additionally pins survivor identity under the `oldest` strategy.
+        let _guard = lock_progress();
+        reset_cancellation_flag();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let newer = dir.join("aaa.txt"); // sorts first lexically, newer mtime
+        let older = dir.join("zzz.txt"); // sorts last lexically, older mtime
+        fs::write(&newer, b"same").expect("write newer");
+        fs::write(&older, b"same").expect("write older");
+        filetime::set_file_mtime(&older, filetime::FileTime::from_unix_time(1_000, 0))
+            .expect("set older mtime");
+        filetime::set_file_mtime(&newer, filetime::FileTime::from_unix_time(2_000, 0))
+            .expect("set newer mtime");
+
+        let policy = policy_with(&[], &[], FallbackStrategy::Oldest);
+        let mut duplicates: HashMap<String, Vec<DuplicateEntry>> = HashMap::new();
+        // List the newer (lexically-first) copy first so a lexical keeper would be
+        // it; `oldest` must instead elect `zzz.txt`.
+        duplicates.insert(
+            "hash".into(),
+            vec![(newer.clone(), 4u64, 0usize), (older.clone(), 4u64, 0usize)],
+        );
+
+        // Build the partition exactly once — the single source the display, the
+        // action, and the metrics all read.
+        let plans = build_group_plans(&duplicates, &policy);
+        assert_eq!(plans.len(), 1);
+        let displayed_survivor = plans[0].survivors[0].0 .0.clone();
+        let displayed_victims = victim_paths(&plans[0].victims);
+        // Sanity: `oldest` (not lexical) really did decide here, so the two orders
+        // genuinely disagree and the test would catch a divergence.
+        assert_eq!(displayed_survivor, older, "oldest must be the survivor");
+        assert_eq!(displayed_victims, vec![newer.clone()]);
+
+        // Metrics derive from the same plans.
+        let removable_files: usize = plans.iter().map(|p| p.victims.len()).sum();
+        assert_eq!(removable_files, 1);
+
+        // The action consumes the same plans, so the acted-on victim is the file
+        // displayed as a victim, and the displayed survivor is what remains.
+        let report = process_duplicates(&plans, &DuplicateAction::Delete, &policy, false, false);
+        assert_eq!(report.total_candidates, removable_files);
+        assert_eq!(report.successes, 1);
+        assert!(
+            displayed_survivor.exists(),
+            "the displayed KEPT survivor must be the file left on disk"
+        );
+        assert!(
+            !displayed_victims[0].exists(),
+            "the displayed victim must be the file actually deleted"
+        );
+    }
+
     // --- Stage 2: protect-aware collapse + two-metric accounting -----------
 
     /// Protect-aware identity collapse (HLD §5.6): a physical file reachable both
@@ -6530,11 +7192,13 @@ mod tests {
             "redundancy is len-1 over the group"
         );
         assert_eq!(scan.redundant_bytes, 8, "two redundant 4-byte copies");
-        assert_eq!(
-            scan.removable_files, 1,
-            "only the one plain copy is removable"
-        );
-        assert_eq!(scan.reclaimable_bytes, 4, "one removable 4-byte victim");
+        // Removable is derived from the per-group plans (the same partition used
+        // for display and action), not from the scan struct.
+        let plans = build_group_plans(&scan.duplicates, &policy);
+        let removable_files: usize = plans.iter().map(|p| p.victims.len()).sum();
+        let reclaimable_bytes: u64 = plans.iter().map(|p| p.victim_bytes()).sum();
+        assert_eq!(removable_files, 1, "only the one plain copy is removable");
+        assert_eq!(reclaimable_bytes, 4, "one removable 4-byte victim");
     }
 
     /// An all-protected group is a no-op: removable is 0 but redundancy is > 0
@@ -6558,11 +7222,14 @@ mod tests {
             "redundancy still counts the extra copy"
         );
         assert!(scan.redundant_bytes > 0, "redundancy bytes are nonzero");
+        let plans = build_group_plans(&scan.duplicates, &policy);
+        let removable_files: usize = plans.iter().map(|p| p.victims.len()).sum();
+        let reclaimable_bytes: u64 = plans.iter().map(|p| p.victim_bytes()).sum();
         assert_eq!(
-            scan.removable_files, 0,
+            removable_files, 0,
             "every copy protected -> nothing removable"
         );
-        assert_eq!(scan.reclaimable_bytes, 0, "nothing reclaimable");
+        assert_eq!(reclaimable_bytes, 0, "nothing reclaimable");
     }
 
     /// Neutral parity (HLD §3.3/§3.5): under `KeepPolicy::default()` on a mixed
@@ -6585,35 +7252,32 @@ mod tests {
         // A unique file (no duplicates).
         fs::write(dir.join("u.txt"), b"unique-bytes").expect("write u");
 
-        let scan = find_duplicates_in_dirs(
-            &[dir.to_path_buf()],
-            false,
-            false,
-            false,
-            &KeepPolicy::default(),
-        )
-        .expect("scan");
+        let policy = KeepPolicy::default();
+        let scan = find_duplicates_in_dirs(&[dir.to_path_buf()], false, false, false, &policy)
+            .expect("scan");
 
         assert_eq!(scan.redundant_files, 3, "A contributes 2, B contributes 1");
+        let plans = build_group_plans(&scan.duplicates, &policy);
+        let removable_files: usize = plans.iter().map(|p| p.victims.len()).sum();
+        let reclaimable_bytes: u64 = plans.iter().map(|p| p.victim_bytes()).sum();
         assert_eq!(
-            scan.removable_files, scan.redundant_files,
+            removable_files, scan.redundant_files,
             "neutral policy: removable == redundancy"
         );
         assert_eq!(
-            scan.reclaimable_bytes, scan.redundant_bytes,
+            reclaimable_bytes, scan.redundant_bytes,
             "neutral policy: reclaimable bytes == redundant bytes"
         );
     }
 
-    /// Equal/common case (HLD §3.5): when removable == redundancy the summary
-    /// wording must be byte-identical to the Stage 1 output so existing behavior
-    /// and snapshot expectations are unchanged.
+    /// Equal/common case (HLD §3.5): when removable == redundancy the summary uses
+    /// the same "duplicate files" wording as the divergent branch (CR N3).
     #[test]
     fn test_format_scan_summary_equal_case() {
         let line = format_scan_summary(100, 12, 4096, 12, 4096, Duration::from_secs(5));
         assert_eq!(
             line,
-            "100 files scanned, 12 duplicates found (4.00 KB wasted) in 5 sec."
+            "100 files scanned, 12 duplicate files (4.00 KB wasted) in 5 sec."
         );
     }
 
@@ -6627,5 +7291,260 @@ mod tests {
             line,
             "100 files scanned, 12 duplicate files (4.00 KB); 9 removable (3.00 KB reclaimable), 3 protected and kept, in 5 sec."
         );
+    }
+
+    // --- Stage 3: resolve_keep_policy (config + flag merge) ----------------
+
+    /// A baseline `Args` with no policy flags and no `--config`, scanning a dummy
+    /// path. Only the policy-relevant fields matter for `resolve_keep_policy`, so
+    /// this helper is intended ONLY for policy-resolution tests — do not feed it to
+    /// `run_app` (its `directories: ["."]` would scan the crate root).
+    fn policy_args() -> Args {
+        Args {
+            directories: vec![PathBuf::from(".")],
+            action: None,
+            dest: None,
+            force: false,
+            quiet: false,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_path: None,
+            summary_silent: false,
+            summary_only: false,
+            log_level: LogLevel::Info,
+            summary_format: SummaryFormat::Text,
+            fail_on_error: false,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: false,
+            keep: None,
+            config: None,
+        }
+    }
+
+    /// Writes a `.mddedupe.toml` into a fresh temp dir and returns the dir (kept
+    /// alive by the caller) and the config path to feed `--config`.
+    fn write_config(contents: &str) -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("config.toml");
+        fs::write(&path, contents).expect("write config");
+        (temp, path)
+    }
+
+    /// A fresh, empty temp dir to inject as `resolve_keep_policy`'s `base_dir`, so
+    /// the `./.mddedupe.toml` auto-discovery lookup is controlled by the test
+    /// rather than depending on the process CWD (where a stray `.mddedupe.toml`
+    /// could silently invert a "no config -> convention" assertion).
+    fn empty_base() -> TempDir {
+        TempDir::new().expect("temp base dir")
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_no_config_is_convention_default() {
+        let _guard = lock_progress();
+        let args = policy_args();
+        // Inject an empty base dir so the no-config branch is exercised regardless
+        // of any `.mddedupe.toml` in the process CWD (de-flake, CR M1 / DA #4).
+        let base = empty_base();
+        let policy = resolve_keep_policy(&args, base.path()).expect("resolve");
+        // Built-in convention: protect `0*` dirs, `00-*`/`00 - *` names, `oldest`.
+        assert!(policy.protect_dir.is_match("0archive"));
+        assert!(policy.protect_name.is_match("00-master.txt"));
+        assert!(policy.protect_name.is_match("00 - master.txt"));
+        assert_eq!(policy.fallback, FallbackStrategy::Oldest);
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_config_applies() {
+        let _guard = lock_progress();
+        let (_temp, config) = write_config(
+            "[keep]\nprotect-dir = [\"keep*\"]\nprotect-name = [\"master-*\"]\nfallback = \"newest\"\n",
+        );
+        let mut args = policy_args();
+        args.config = Some(config);
+        let base = empty_base();
+        let policy = resolve_keep_policy(&args, base.path()).expect("resolve");
+        assert!(policy.protect_dir.is_match("keep-this"));
+        assert!(!policy.protect_dir.is_match("0archive"));
+        assert!(policy.protect_name.is_match("master-1.txt"));
+        assert_eq!(policy.fallback, FallbackStrategy::Newest);
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_flag_overrides_config() {
+        let _guard = lock_progress();
+        let (_temp, config) =
+            write_config("[keep]\nprotect-dir = [\"cfgdir*\"]\nfallback = \"shortest\"\n");
+        let mut args = policy_args();
+        args.config = Some(config);
+        args.protect_dir = vec!["flagdir*".to_string()];
+        args.keep = Some(FallbackStrategy::Lexical);
+        let base = empty_base();
+        let policy = resolve_keep_policy(&args, base.path()).expect("resolve");
+        // Flag replaces the config dir list; flag overrides the config fallback.
+        assert!(policy.protect_dir.is_match("flagdir-x"));
+        assert!(!policy.protect_dir.is_match("cfgdir-x"));
+        assert_eq!(policy.fallback, FallbackStrategy::Lexical);
+        // protect-name was neither flagged nor in config -> built-in default.
+        assert!(policy.protect_name.is_match("00-keep"));
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_protect_name_flag_overrides_config() {
+        // Mirror of the dir-list override test for the NAME list (DA #5 / #7 blind
+        // spot): config sets `protect-name`, the flag must REPLACE it (not merge),
+        // while the untouched `protect-dir` still falls through to the config value.
+        let _guard = lock_progress();
+        let (_temp, config) =
+            write_config("[keep]\nprotect-dir = [\"cfgdir*\"]\nprotect-name = [\"cfgname-*\"]\n");
+        let mut args = policy_args();
+        args.config = Some(config);
+        args.protect_name = vec!["flagname-*".to_string()];
+        let base = empty_base();
+        let policy = resolve_keep_policy(&args, base.path()).expect("resolve");
+        // Flag replaces the config name list.
+        assert!(policy.protect_name.is_match("flagname-1.txt"));
+        assert!(
+            !policy.protect_name.is_match("cfgname-1.txt"),
+            "the name flag must replace, not merge with, the config name list"
+        );
+        // protect-dir was not flagged -> the config dir value still applies.
+        assert!(policy.protect_dir.is_match("cfgdir-x"));
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_auto_discovers_dot_config() {
+        // Exercise the `./.mddedupe.toml` AUTO-DISCOVERY + parse branch (DA #5): no
+        // `--config` flag, but a `.mddedupe.toml` exists in the injected base dir.
+        // Its values must be loaded and applied — not the built-in defaults.
+        let _guard = lock_progress();
+        let base = empty_base();
+        fs::write(
+            base.path().join(".mddedupe.toml"),
+            "[keep]\nprotect-dir = [\"disco*\"]\nfallback = \"shortest\"\n",
+        )
+        .expect("write .mddedupe.toml");
+
+        let args = policy_args(); // config: None -> auto-discovery
+        let policy = resolve_keep_policy(&args, base.path()).expect("resolve");
+        assert!(
+            policy.protect_dir.is_match("disco-vault"),
+            "auto-discovered config dir glob must apply"
+        );
+        assert!(
+            !policy.protect_dir.is_match("0archive"),
+            "the discovered config replaces the built-in default dir list"
+        );
+        assert_eq!(
+            policy.fallback,
+            FallbackStrategy::Shortest,
+            "auto-discovered config fallback must apply"
+        );
+        // protect-name omitted in the file -> built-in default still used.
+        assert!(policy.protect_name.is_match("00-master.txt"));
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_no_protect_is_neutral_today_parity() {
+        let _guard = lock_progress();
+        let mut args = policy_args();
+        args.no_protect = true;
+        let base = empty_base();
+        let policy = resolve_keep_policy(&args, base.path()).expect("resolve");
+        // `--no-protect` is the neutral policy = today's exact behavior (HLD
+        // §3.3/§4.1): empty protect lists AND a `lexical` fallback.
+        assert!(!policy.protect_dir.is_match("0archive"));
+        assert!(!policy.protect_name.is_match("00-master.txt"));
+        assert_eq!(
+            policy.fallback,
+            FallbackStrategy::Lexical,
+            "--no-protect alone yields today's neutral lexical fallback"
+        );
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_no_protect_keep_overrides_neutral_fallback() {
+        let _guard = lock_progress();
+        let mut args = policy_args();
+        args.no_protect = true;
+        args.keep = Some(FallbackStrategy::Oldest);
+        let base = empty_base();
+        let policy = resolve_keep_policy(&args, base.path()).expect("resolve");
+        // An explicit `--keep` still wins over the neutral lexical fallback.
+        assert!(!policy.protect_dir.is_match("0archive"));
+        assert_eq!(policy.fallback, FallbackStrategy::Oldest);
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_omitted_config_field_uses_default() {
+        let _guard = lock_progress();
+        // Config sets only the fallback; the omitted protect lists fall back to
+        // the built-in convention defaults.
+        let (_temp, config) = write_config("[keep]\nfallback = \"newest\"\n");
+        let mut args = policy_args();
+        args.config = Some(config);
+        let base = empty_base();
+        let policy = resolve_keep_policy(&args, base.path()).expect("resolve");
+        assert!(policy.protect_dir.is_match("0archive"));
+        assert!(policy.protect_name.is_match("00-master.txt"));
+        assert_eq!(policy.fallback, FallbackStrategy::Newest);
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_explicit_empty_list_disables() {
+        let _guard = lock_progress();
+        // An explicit `protect-dir = []` disables dir protection persistently.
+        let (_temp, config) = write_config("[keep]\nprotect-dir = []\n");
+        let mut args = policy_args();
+        args.config = Some(config);
+        let base = empty_base();
+        let policy = resolve_keep_policy(&args, base.path()).expect("resolve");
+        assert!(
+            !policy.protect_dir.is_match("0archive"),
+            "explicit [] disables"
+        );
+        // protect-name omitted -> still the built-in default.
+        assert!(policy.protect_name.is_match("00-master.txt"));
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_unknown_field_rejected() {
+        let _guard = lock_progress();
+        let (_temp, config) = write_config("[keep]\nprotect-dirs = [\"0*\"]\n");
+        let mut args = policy_args();
+        args.config = Some(config);
+        let base = empty_base();
+        match resolve_keep_policy(&args, base.path()) {
+            Err(AppError::ConfigParse(_, _)) => {}
+            Err(other) => panic!("expected ConfigParse, got {:?}", other),
+            Ok(_) => panic!("typo'd key must be fatal"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_missing_config_is_fatal() {
+        let _guard = lock_progress();
+        let mut args = policy_args();
+        args.config = Some(PathBuf::from("definitely-not-a-real-config-xyz.toml"));
+        let base = empty_base();
+        match resolve_keep_policy(&args, base.path()) {
+            Err(AppError::ConfigUnreadable(_, _)) => {}
+            Err(other) => panic!("expected ConfigUnreadable, got {:?}", other),
+            Ok(_) => panic!("missing --config must be fatal"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_keep_policy_bad_glob_is_fatal() {
+        let _guard = lock_progress();
+        let mut args = policy_args();
+        // An unmatched character class is an invalid glob.
+        args.protect_dir = vec!["[".to_string()];
+        let base = empty_base();
+        match resolve_keep_policy(&args, base.path()) {
+            Err(AppError::InvalidGlob(pattern, _)) => assert_eq!(pattern, "["),
+            Err(other) => panic!("expected InvalidGlob, got {:?}", other),
+            Ok(_) => panic!("bad glob must be fatal"),
+        }
     }
 }
