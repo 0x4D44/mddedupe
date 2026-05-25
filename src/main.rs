@@ -2400,6 +2400,106 @@ mod tests {
         reset_cancellation_flag();
     }
 
+    /// A minimal `--action delete --force --no-protect` argument set over a single
+    /// directory, used by the TOCTOU tests below. `--no-protect` pins the neutral
+    /// policy so the lexically-first file (`file1.txt`) is the deterministic
+    /// survivor and `file2.txt` is the victim.
+    fn toctou_delete_args(dir: &Path, fail_on_error: bool) -> Args {
+        Args {
+            directories: vec![dir.to_path_buf()],
+            action: Some("delete".into()),
+            dest: None,
+            force: true,
+            quiet: true,
+            create_dest: false,
+            follow_symlinks: false,
+            summary_format: SummaryFormat::Text,
+            summary_path: None,
+            summary_silent: true,
+            summary_only: false,
+            log_level: LogLevel::None,
+            fail_on_error,
+            protect_dir: vec![],
+            protect_name: vec![],
+            no_protect: true,
+            keep: None,
+            config: None,
+        }
+    }
+
+    #[test]
+    fn test_toctou_victim_vanishes_between_hash_and_delete_is_reported() {
+        // TOCTOU (vanish): a victim is removed in the window between hashing (the
+        // "check") and the destructive action (the "use"). The post-hash hook fires
+        // after every file is hashed but before any victim is acted on, so it
+        // reproduces the race deterministically. The run must not crash, the
+        // SURVIVOR must stay intact, and with `--fail-on-error` the vanished victim
+        // must surface as a reported per-file failure rather than being silently
+        // swallowed or aborting the group mid-way.
+        let _guard = lock_progress();
+        set_progress_env();
+        reset_cancellation_flag();
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let survivor = dir.join("file1.txt");
+        let victim = dir.join("file2.txt");
+        fs::write(&survivor, b"dup").expect("write survivor");
+        fs::write(&victim, b"dup").expect("write victim");
+
+        let victim_in_hook = victim.clone();
+        test_support::set_post_hash_hook(move || {
+            fs::remove_file(&victim_in_hook).expect("hook removes the victim mid-run");
+        });
+
+        let result = run_app(toctou_delete_args(dir, true), Cursor::new(Vec::new()));
+        assert!(
+            matches!(result, Err(AppError::ActionFailures(1))),
+            "a victim that vanished mid-run must be reported as one failure, got: {:?}",
+            result
+        );
+        assert!(survivor.exists(), "the survivor must remain after the race");
+        assert!(!victim.exists(), "the victim is gone (removed in the race)");
+        reset_cancellation_flag();
+    }
+
+    #[test]
+    fn test_toctou_victim_modified_after_hash_is_still_deleted() {
+        // TOCTOU (change), documented limitation: the action acts on the
+        // survivor/victim PLAN computed from scan-time hashes — it does NOT re-hash
+        // at delete time. A victim whose CONTENT changes in the window between
+        // hashing and deletion is therefore still deleted, even though it is no
+        // longer a duplicate of the survivor. This pins the current (inherent)
+        // behavior so that adding a re-verification step later is a deliberate,
+        // visible change rather than an accident.
+        let _guard = lock_progress();
+        set_progress_env();
+        reset_cancellation_flag();
+
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        let survivor = dir.join("file1.txt");
+        let victim = dir.join("file2.txt");
+        fs::write(&survivor, b"dup").expect("write survivor");
+        fs::write(&victim, b"dup").expect("write victim");
+
+        let victim_in_hook = victim.clone();
+        test_support::set_post_hash_hook(move || {
+            fs::write(&victim_in_hook, b"CHANGED - no longer a duplicate")
+                .expect("hook mutates the victim mid-run");
+        });
+
+        let result = run_app(toctou_delete_args(dir, false), Cursor::new(Vec::new()));
+        assert!(result.is_ok(), "the run should complete: {:?}", result);
+        assert!(survivor.exists(), "the survivor is untouched");
+        assert!(
+            !victim.exists(),
+            "the victim is deleted despite its content no longer matching — the \
+             scan-time plan is not re-verified at action time"
+        );
+        reset_cancellation_flag();
+    }
+
     #[test]
     fn test_write_summary_to_path_handles_nested_dirs_and_newline() {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
@@ -5014,6 +5114,36 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_files_are_treated_as_duplicates() {
+        // CORNER CASE: every zero-byte file shares size 0 AND the same SHA-256, so
+        // the core collapses them all into a SINGLE duplicate group. This pins that
+        // behavior: N empty files yield N-1 redundant files but ZERO redundant
+        // bytes (empty files reclaim no space). The two-metric split (files vs
+        // bytes) is exactly what makes this legible — a run would remove files yet
+        // honestly report 0 bytes saved.
+        let _guard = lock_progress();
+        set_progress_env();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        for name in ["a.txt", "b.txt", "c.log", "d"] {
+            fs::write(dir.join(name), b"").expect("write empty file");
+        }
+
+        let (dups, scanned, redundant_files, redundant_bytes, _) =
+            scan_one(dir, false, false, false).expect("scan");
+
+        assert_eq!(scanned, 4, "all four empty files are scanned");
+        assert_eq!(dups.len(), 1, "all empty files collapse into one group");
+        let group = dups.values().next().expect("one duplicate group");
+        assert_eq!(group.len(), 4, "every empty file is a member of that group");
+        assert_eq!(redundant_files, 3, "four empty files leave three redundant");
+        assert_eq!(
+            redundant_bytes, 0,
+            "empty files reclaim no space even though files are redundant"
+        );
+    }
+
+    #[test]
     fn test_nested_directory_scan() {
         let _guard = lock_progress();
         set_progress_env();
@@ -6850,6 +6980,244 @@ mod tests {
         let (survivors, victims) = select_survivors(&group, &policy);
         assert_eq!(survivors.len(), 2);
         assert!(victims.is_empty());
+    }
+
+    // --- select_survivors property tests (proptest) -----------------------
+    //
+    // The example tests above check named scenarios; these check the invariants
+    // that must hold for EVERY (group, policy) pair. They are pure: `select_
+    // survivors` only reads paths, and for the mtime strategies it stats them —
+    // the synthetic, non-existent paths simply yield no mtime, so every entry
+    // ties on that key and the deterministic path tiebreak decides.
+    mod selection_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Index in `group` of the entry a returned reference borrows. Uses
+        /// pointer identity, so duplicate paths within a group stay distinct.
+        fn index_of(group: &[DuplicateEntry], e: &DuplicateEntry) -> usize {
+            group
+                .iter()
+                .position(|x| std::ptr::eq(x, e))
+                .expect("returned reference must borrow an element of the group")
+        }
+
+        /// Directory components mix protect-matching (`0*`) and plain names so
+        /// generated paths fall on both sides of every protect rule.
+        fn arb_path() -> impl Strategy<Value = String> {
+            let dir = prop::sample::select(vec![
+                "00-keep", "0archive", "2020", "tmp", "photos", "alpha", "beta",
+            ]);
+            let file = prop::sample::select(vec![
+                "00-master.jpg",
+                "00 - copy.jpg",
+                "img.jpg",
+                "notes.txt",
+                "data.bin",
+                "x",
+            ]);
+            (prop::collection::vec(dir, 1..4), file).prop_map(|(dirs, file)| {
+                let mut path = String::from("/synthroot");
+                for component in dirs {
+                    path.push('/');
+                    path.push_str(component);
+                }
+                path.push('/');
+                path.push_str(file);
+                path
+            })
+        }
+
+        fn arb_entry() -> impl Strategy<Value = DuplicateEntry> {
+            (arb_path(), 0u64..1_000, 0usize..3)
+                .prop_map(|(path, size, root)| (PathBuf::from(path), size, root))
+        }
+
+        fn arb_group() -> impl Strategy<Value = Vec<DuplicateEntry>> {
+            prop::collection::vec(arb_entry(), 1..6)
+        }
+
+        fn arb_glob_list() -> impl Strategy<Value = Vec<String>> {
+            prop::sample::select(vec![
+                Vec::<String>::new(),
+                vec!["0*".to_string()],
+                vec!["alpha*".to_string()],
+                vec!["00-*".to_string(), "00 - *".to_string()],
+                vec!["*.txt".to_string()],
+            ])
+        }
+
+        fn arb_fallback() -> impl Strategy<Value = FallbackStrategy> {
+            prop_oneof![
+                Just(FallbackStrategy::Oldest),
+                Just(FallbackStrategy::Newest),
+                Just(FallbackStrategy::Shortest),
+                Just(FallbackStrategy::Lexical),
+            ]
+        }
+
+        /// A Debug-friendly policy description: (protect-dir globs, protect-name
+        /// globs, fallback). `KeepPolicy` holds opaque `GlobSet`s that are not
+        /// `Debug`, which proptest requires of generated values, so we generate the
+        /// spec and build the policy inside each test (shrink output then shows the
+        /// actual glob strings rather than an opaque set).
+        type PolicySpec = (Vec<String>, Vec<String>, FallbackStrategy);
+
+        fn arb_policy_spec() -> impl Strategy<Value = PolicySpec> {
+            (arb_glob_list(), arb_glob_list(), arb_fallback())
+        }
+
+        fn make_policy(spec: &PolicySpec) -> KeepPolicy {
+            let (protect_dir, protect_name, fallback) = spec;
+            KeepPolicy {
+                protect_dir: compile_protect(protect_dir).expect("dir globset"),
+                protect_name: compile_protect(protect_name).expect("name globset"),
+                fallback: *fallback,
+            }
+        }
+
+        proptest! {
+            /// Every entry lands in exactly one of {survivors, victims}: the
+            /// partition is complete (all indices covered) and disjoint (no index
+            /// twice). This is the safety-critical invariant — a missing index is a
+            /// file silently dropped from the plan; a doubled one is a file both
+            /// kept and acted on.
+            #[test]
+            fn prop_partition_is_complete_and_disjoint(
+                group in arb_group(),
+                spec in arb_policy_spec(),
+            ) {
+                let policy = make_policy(&spec);
+                let (survivors, victims) = select_survivors(&group, &policy);
+                let mut indices: Vec<usize> = survivors
+                    .iter()
+                    .map(|(e, _)| index_of(&group, e))
+                    .chain(victims.iter().map(|e| index_of(&group, e)))
+                    .collect();
+                indices.sort_unstable();
+                let expected: Vec<usize> = (0..group.len()).collect();
+                prop_assert_eq!(indices, expected);
+            }
+
+            /// A non-empty group always keeps at least one survivor: the engine
+            /// never plans to remove every copy.
+            #[test]
+            fn prop_non_empty_group_keeps_a_survivor(
+                group in arb_group(),
+                spec in arb_policy_spec(),
+            ) {
+                let policy = make_policy(&spec);
+                let (survivors, _victims) = select_survivors(&group, &policy);
+                prop_assert!(!survivors.is_empty());
+            }
+
+            /// Survivor reasons never mix: a `Fallback` survivor is the sole
+            /// survivor (so nothing was protected); otherwise every survivor is a
+            /// protected copy.
+            #[test]
+            fn prop_reasons_are_consistent(
+                group in arb_group(),
+                spec in arb_policy_spec(),
+            ) {
+                let policy = make_policy(&spec);
+                let (survivors, _victims) = select_survivors(&group, &policy);
+                let any_fallback =
+                    survivors.iter().any(|(_, r)| *r == SurvivorReason::Fallback);
+                if any_fallback {
+                    prop_assert_eq!(survivors.len(), 1);
+                } else {
+                    prop_assert!(!survivors.is_empty());
+                }
+            }
+
+            /// The two protection extremes, asserted whenever they arise (no
+            /// `prop_assume`, so no rejection pressure): nothing protected ⇒ one
+            /// fallback survivor and the rest victims; everything protected ⇒ all
+            /// survive, no victims.
+            #[test]
+            fn prop_protection_extremes(
+                group in arb_group(),
+                spec in arb_policy_spec(),
+            ) {
+                let policy = make_policy(&spec);
+                let none_protected =
+                    group.iter().all(|e| protect_reason(e, &policy).is_none());
+                let all_protected =
+                    group.iter().all(|e| protect_reason(e, &policy).is_some());
+                let (survivors, victims) = select_survivors(&group, &policy);
+                if none_protected {
+                    prop_assert_eq!(survivors.len(), 1);
+                    prop_assert_eq!(survivors[0].1, SurvivorReason::Fallback);
+                    prop_assert_eq!(victims.len(), group.len() - 1);
+                }
+                if all_protected {
+                    prop_assert!(victims.is_empty());
+                    prop_assert_eq!(survivors.len(), group.len());
+                }
+            }
+
+            /// Each survivor's recorded reason matches the rule that actually fires
+            /// for its path (dir rule wins over name when both match; `Fallback`
+            /// means neither matched).
+            #[test]
+            fn prop_survivor_reason_matches_rule(
+                group in arb_group(),
+                spec in arb_policy_spec(),
+            ) {
+                let policy = make_policy(&spec);
+                let (survivors, _victims) = select_survivors(&group, &policy);
+                for (e, reason) in &survivors {
+                    let path = e.0.as_path();
+                    match reason {
+                        SurvivorReason::ProtectedDir => {
+                            prop_assert!(any_ancestor_dir_matches(path, &policy.protect_dir));
+                        }
+                        SurvivorReason::ProtectedName => {
+                            prop_assert!(!any_ancestor_dir_matches(path, &policy.protect_dir));
+                            prop_assert!(file_name_matches(path, &policy.protect_name));
+                        }
+                        SurvivorReason::Fallback => {
+                            prop_assert!(!any_ancestor_dir_matches(path, &policy.protect_dir));
+                            prop_assert!(!file_name_matches(path, &policy.protect_name));
+                        }
+                    }
+                }
+            }
+
+            /// Selection is deterministic: the same group and policy always yield
+            /// the same survivor and victim paths.
+            #[test]
+            fn prop_selection_is_deterministic(
+                group in arb_group(),
+                spec in arb_policy_spec(),
+            ) {
+                let policy = make_policy(&spec);
+                let (s1, v1) = select_survivors(&group, &policy);
+                let (s2, v2) = select_survivors(&group, &policy);
+                let survivor_paths = |s: &[(&DuplicateEntry, SurvivorReason)]| {
+                    s.iter().map(|(e, r)| (e.0.clone(), *r)).collect::<Vec<_>>()
+                };
+                let victim_paths =
+                    |v: &[&DuplicateEntry]| v.iter().map(|e| e.0.clone()).collect::<Vec<_>>();
+                prop_assert_eq!(survivor_paths(&s1), survivor_paths(&s2));
+                prop_assert_eq!(victim_paths(&v1), victim_paths(&v2));
+            }
+
+            /// Under the neutral default policy the survivor is the `survivor_cmp`
+            /// minimum: it sorts at or before every victim (lowest root_index, then
+            /// lexically first path). Pins the "keep the first-listed copy" contract
+            /// the read-only display and the action loop both rely on.
+            #[test]
+            fn prop_neutral_policy_keeps_survivor_cmp_minimum(group in arb_group()) {
+                let policy = KeepPolicy::default();
+                let (survivors, victims) = select_survivors(&group, &policy);
+                prop_assert_eq!(survivors.len(), 1);
+                let keeper = survivors[0].0;
+                for victim in victims.iter().copied() {
+                    prop_assert!(survivor_cmp(keeper, victim) != std::cmp::Ordering::Greater);
+                }
+            }
+        }
     }
 
     #[test]

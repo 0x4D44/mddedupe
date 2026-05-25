@@ -60,6 +60,52 @@ fn cli_action_delete_force_removes_duplicate() {
 }
 
 #[test]
+fn cli_empty_files_dedupe_to_single_survivor() {
+    // CORNER CASE end-to-end: several zero-byte files are byte-identical, so a
+    // forced delete must reduce them to exactly one survivor. Neutral policy
+    // (`--no-protect`) keeps the lexically-first path (`a.txt`). Pins destructive
+    // behavior on empty files through the real binary.
+    let temp = assert_fs::TempDir::new().expect("Failed to create temp dir");
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        temp.child(name)
+            .touch()
+            .expect("Failed to create empty file");
+    }
+    let dir = temp.path();
+
+    cargo_bin_cmd!("mddedupe")
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            dir.to_str().unwrap(),
+            "--action",
+            "delete",
+            "--force",
+            "--no-protect",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Operation complete."));
+
+    let survivors: Vec<_> = fs::read_dir(dir)
+        .expect("read temp dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(
+        survivors.len(),
+        1,
+        "exactly one empty file must survive, found: {:?}",
+        survivors
+    );
+    assert_eq!(
+        survivors[0].to_string_lossy(),
+        "a.txt",
+        "the lexically-first empty file is the neutral-policy survivor"
+    );
+}
+
+#[test]
 fn cli_prompt_cancel_preserves_files() {
     let temp = create_duplicate_fixture();
     let dir = temp.path();
