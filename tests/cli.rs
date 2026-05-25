@@ -900,3 +900,238 @@ fn cli_bad_protect_glob_exits_non_zero() {
         .failure()
         .stderr(predicates::str::contains("Invalid protect glob"));
 }
+
+// --- Coverage gaps: policy exercised through the real binary --------------
+
+#[test]
+fn cli_config_cwd_discovery_protects_named_copy() {
+    // Exercise the binary's REAL `./.mddedupe.toml` auto-discovery (resolved
+    // against the process current directory, HLD §4.2), not `resolve_keep_policy`
+    // with an injected base. We write a config whose ONLY protect rule keeps files
+    // named `keepme.*`, and we set `protect-dir = []` + `fallback = "lexical"` so
+    // the built-in convention (`0*` dirs, `00-*` names, `oldest`) cannot interfere.
+    //
+    // Under that config the survivor is provably driven by the config: the kept
+    // copy `keepme.txt` sorts AFTER the victim `aaa.txt` lexically, so a neutral
+    // `lexical` fallback alone would keep `aaa.txt`. The fact that `keepme.txt`
+    // survives proves the config's protect-name rule loaded and took effect.
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child(".mddedupe.toml")
+        .write_str(
+            "[keep]\nprotect-dir = []\nprotect-name = [\"keepme.*\"]\nfallback = \"lexical\"\n",
+        )
+        .expect("write config");
+    let kept = temp.child("keepme.txt");
+    let victim = temp.child("aaa.txt");
+    kept.write_str("shared content").expect("write kept");
+    victim.write_str("shared content").expect("write victim");
+
+    cargo_bin_cmd!("mddedupe")
+        // CWD is the temp dir, so `./.mddedupe.toml` discovery finds OUR config.
+        .current_dir(temp.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            temp.path().to_str().unwrap(),
+            "--action",
+            "delete",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "KEPT (protected: name keepme.txt)",
+        ));
+
+    assert!(
+        kept.path().exists(),
+        "keepme.txt must be protected by the discovered config and kept"
+    );
+    assert!(
+        !victim.path().exists(),
+        "aaa.txt must be deleted (config protected only keepme.*; lexical fallback \
+         would otherwise have kept the alphabetically-first aaa.txt)"
+    );
+}
+
+#[test]
+fn cli_malformed_config_unknown_field_rejected() {
+    // A `.mddedupe.toml` with a typo'd key must be rejected end to end by
+    // `deny_unknown_fields`. The existing CLI config-error test only covers a
+    // MISSING file; this covers a present-but-malformed one supplied via
+    // `--config`. The binary must exit non-zero with the parse-error wording and
+    // name the offending field so the user can fix the typo.
+    let temp = create_duplicate_fixture();
+    let config = NamedTempFile::new("bad.mddedupe.toml").expect("create config file");
+    config
+        .write_str("[keep]\nprotct-dir = [\"x\"]\n")
+        .expect("write malformed config");
+
+    cargo_bin_cmd!("mddedupe")
+        .current_dir(temp.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            temp.path().to_str().unwrap(),
+            "--config",
+            config.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Failed to parse config file"))
+        .stderr(predicates::str::contains("protct-dir"));
+}
+
+#[test]
+fn cli_delete_all_protected_group_is_noop() {
+    // Every copy in the hash group is protected by the convention default (all
+    // live under `0*` directories), so there is no victim. A `--action delete
+    // --force` run must succeed, delete NOTHING, and report zero work
+    // ("Successes: 0 / 0"). No flags / no config => the live convention default.
+    let parent = assert_fs::TempDir::new().expect("create parent");
+    let a = parent.child("00-a");
+    let b = parent.child("00-b");
+    a.create_dir_all().expect("create 00-a");
+    b.create_dir_all().expect("create 00-b");
+    let copy_a = a.child("x.txt");
+    let copy_b = b.child("x.txt");
+    copy_a.write_str("shared content").expect("write a");
+    copy_b.write_str("shared content").expect("write b");
+
+    cargo_bin_cmd!("mddedupe")
+        .current_dir(parent.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            parent.path().to_str().unwrap(),
+            "--action",
+            "delete",
+            "--force",
+        ])
+        .assert()
+        .success()
+        // Every copy protected => redundancy 1, removable 0; the divergent
+        // summary line reports the removable figure explicitly.
+        .stdout(predicates::str::contains("0 removable"))
+        // No victims => no work performed.
+        .stdout(predicates::str::contains(
+            "Operation complete. Successes: 0 / 0",
+        ));
+
+    assert!(
+        copy_a.path().exists() && copy_b.path().exists(),
+        "every copy is protected; nothing may be deleted"
+    );
+}
+
+#[test]
+fn cli_move_action_relocates_only_unprotected_victims() {
+    // The action path (not just `delete`) is policy-driven. With the convention
+    // default a `00-*` master is protected; the plain duplicate is the lone victim.
+    // `--action move --dest <dir> --force` must leave the master in place and
+    // relocate only the victim into the destination directory.
+    let (temp, master, plain) = create_protect_fixture();
+    let dest = assert_fs::TempDir::new().expect("create dest");
+
+    cargo_bin_cmd!("mddedupe")
+        .current_dir(temp.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            temp.path().to_str().unwrap(),
+            "--action",
+            "move",
+            "--dest",
+            dest.path().to_str().unwrap(),
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "KEPT (protected: name 00-master.txt)",
+        ))
+        .stdout(predicates::str::contains(
+            "Operation complete. Successes: 1 / 1",
+        ));
+
+    assert!(
+        master.exists(),
+        "the 00-* protected master must stay in place during a move action"
+    );
+    assert!(
+        !plain.exists(),
+        "the unprotected plain copy must be moved out of the scan tree"
+    );
+    let moved = dest.path().join("copy.txt");
+    assert!(
+        moved.exists(),
+        "the victim should have been relocated into the destination directory"
+    );
+}
+
+#[test]
+fn cli_divergent_two_metric_summary_json() {
+    // With a group that retains TWO protected survivors plus one plain victim, the
+    // removable metric must be strictly less than the redundancy metric, and that
+    // divergence must surface in the JSON summary (not only the text line). Two
+    // copies live under `0*` dirs (protected by the convention default) and one is
+    // plain: redundancy = 2 (len - 1), removable = 1 (the single victim).
+    let parent = assert_fs::TempDir::new().expect("create parent");
+    let a = parent.child("00-a");
+    let b = parent.child("00-b");
+    let c = parent.child("plain");
+    a.create_dir_all().expect("create 00-a");
+    b.create_dir_all().expect("create 00-b");
+    c.create_dir_all().expect("create plain");
+    a.child("x.txt").write_str("shared").expect("write a");
+    b.child("x.txt").write_str("shared").expect("write b");
+    c.child("x.txt").write_str("shared").expect("write c");
+
+    let assert = cargo_bin_cmd!("mddedupe")
+        .current_dir(parent.path())
+        .env("MDDEDUPE_SCAN_PROGRESS_MS", "0")
+        .env("MDDEDUPE_HASH_PROGRESS_MS", "0")
+        .args([
+            "--summary-format",
+            "json",
+            "--quiet",
+            parent.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone())
+        .expect("stdout should be valid UTF-8");
+    let json_start = output
+        .find('{')
+        .expect("JSON output should contain an object");
+    let summary: Value =
+        serde_json::from_str(&output[json_start..]).expect("expected JSON summary output");
+
+    let duplicate_files = summary["duplicate_files"].as_u64().unwrap();
+    let removable_files = summary["removable_files"].as_u64().unwrap();
+    let duplicate_wasted = summary["duplicate_wasted_bytes"].as_u64().unwrap();
+    let reclaimable = summary["reclaimable_bytes"].as_u64().unwrap();
+
+    assert_eq!(
+        duplicate_files, 2,
+        "redundancy is len-1 = 2 for a three-copy group"
+    );
+    assert_eq!(
+        removable_files, 1,
+        "only the single unprotected copy is removable"
+    );
+    assert!(
+        removable_files < duplicate_files,
+        "the two metrics must diverge in JSON: removable_files ({}) < duplicate_files ({})",
+        removable_files,
+        duplicate_files
+    );
+    assert!(
+        reclaimable < duplicate_wasted,
+        "reclaimable_bytes ({}) must be < duplicate_wasted_bytes ({}) when extra \
+         protected survivors are retained",
+        reclaimable,
+        duplicate_wasted
+    );
+}
