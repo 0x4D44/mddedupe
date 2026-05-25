@@ -130,11 +130,25 @@ fn file_name_matches(path: &Path, set: &GlobSet) -> bool {
     }
 }
 
+/// Returns the protect reason for an entry, or `None` if it is unprotected. The
+/// dir rule is tested first so it wins the explain label when a file matches both
+/// (HLD §3.2). Shared between `select_survivors` and `collapse_group_by_identity`
+/// so the protect predicate has a single definition.
+fn protect_reason(entry: &DuplicateEntry, policy: &KeepPolicy) -> Option<SurvivorReason> {
+    let path = entry.0.as_path();
+    if any_ancestor_dir_matches(path, &policy.protect_dir) {
+        Some(SurvivorReason::ProtectedDir)
+    } else if file_name_matches(path, &policy.protect_name) {
+        Some(SurvivorReason::ProtectedName)
+    } else {
+        None
+    }
+}
+
 /// Splits a duplicate group into survivors (kept, with reason) and victims (to
 /// act on), per the "protect, then fall back" model (HLD §3.1, §5.2). This is the
 /// single source of truth shared by the action and display call sites so the two
-/// can never drift. (`collapse_group_by_identity` still uses `survivor_cmp`
-/// directly and is left protect-unaware until Stage 3 — HLD §5.6.)
+/// can never drift.
 ///
 /// With `KeepPolicy::default()` (empty globs, `Lexical`) nothing is ever
 /// protected, so the result is the `survivor_cmp`-first element as the sole
@@ -158,13 +172,9 @@ fn select_survivors<'a>(
     let mut unprotected: Vec<&DuplicateEntry> = Vec::new();
 
     for entry in group {
-        let path = entry.0.as_path();
-        if any_ancestor_dir_matches(path, &policy.protect_dir) {
-            survivors.push((entry, SurvivorReason::ProtectedDir));
-        } else if file_name_matches(path, &policy.protect_name) {
-            survivors.push((entry, SurvivorReason::ProtectedName));
-        } else {
-            unprotected.push(entry);
+        match protect_reason(entry, policy) {
+            Some(reason) => survivors.push((entry, reason)),
+            None => unprotected.push(entry),
         }
     }
 
@@ -591,15 +601,37 @@ fn hash_file(path: &Path) -> io::Result<String> {
 /// on such a "duplicate" would destroy the data the survivor points at.
 ///
 /// For each entry we resolve its `FileId` via `fs::metadata` and keep exactly one
-/// entry per distinct identity. Among entries sharing an identity, the survivor
-/// preference is preserved by keeping the one that sorts first under
-/// `survivor_cmp` (lowest `root_index`, then alphabetical path). An entry whose
-/// metadata cannot be read is treated as having a distinct identity and is never
-/// collapsed away — it is safer to keep it than to silently drop it.
+/// entry per distinct identity. Among entries sharing an identity, the kept
+/// representative is chosen protect-aware (HLD §5.6): a **protected** alias is
+/// preferred so a physical file reachable through a `protect_dir`/`protect_name`
+/// path is never collapsed to a plain alias and then deleted. When neither (or
+/// both) of two aliases is protected, the `survivor_cmp`-first entry wins (lowest
+/// `root_index`, then alphabetical path) — which is the entire rule under the
+/// neutral default, so behavior there is unchanged. An entry whose metadata cannot
+/// be read is treated as having a distinct identity and is never collapsed away —
+/// it is safer to keep it than to silently drop it.
 ///
 /// This runs only over already-filtered candidate groups (tiny), so there is no
 /// hot-loop cost.
-fn collapse_group_by_identity(group: &mut Vec<DuplicateEntry>) {
+/// Decides whether an incoming alias should replace the current representative
+/// when both name the same physical file (HLD §5.6). A protected alias beats an
+/// unprotected one; if both are protected or both unprotected, the one that sorts
+/// first under `survivor_cmp` wins (replace iff the incoming alias sorts before
+/// the current one). Pure and platform-independent so the protect-preference
+/// policy can be unit-tested without filesystem aliasing.
+fn prefer_replacement(
+    incoming_protected: bool,
+    current_protected: bool,
+    incoming_sorts_before: bool,
+) -> bool {
+    match (incoming_protected, current_protected) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => incoming_sorts_before,
+    }
+}
+
+fn collapse_group_by_identity(group: &mut Vec<DuplicateEntry>, policy: &KeepPolicy) {
     let mut seen: HashMap<FileId, usize> = HashMap::new();
     let mut distinct: Vec<DuplicateEntry> = Vec::with_capacity(group.len());
     for entry in group.drain(..) {
@@ -610,9 +642,19 @@ fn collapse_group_by_identity(group: &mut Vec<DuplicateEntry>) {
         match id {
             Some(id) => match seen.get(&id).copied() {
                 Some(index) => {
-                    // Already have a representative for this physical file; keep
-                    // whichever entry sorts first so the survivor preference holds.
-                    if survivor_cmp(&entry, &distinct[index]) == std::cmp::Ordering::Less {
+                    // Already have a representative for this physical file. Prefer a
+                    // protected alias as the survivor; otherwise (neither or both
+                    // protected) keep whichever sorts first under `survivor_cmp`.
+                    let incoming_protected = protect_reason(&entry, policy).is_some();
+                    let current_protected = protect_reason(&distinct[index], policy).is_some();
+                    let incoming_sorts_before =
+                        survivor_cmp(&entry, &distinct[index]) == std::cmp::Ordering::Less;
+                    let replace = prefer_replacement(
+                        incoming_protected,
+                        current_protected,
+                        incoming_sorts_before,
+                    );
+                    if replace {
                         distinct[index] = entry;
                     }
                 }
@@ -628,34 +670,48 @@ fn collapse_group_by_identity(group: &mut Vec<DuplicateEntry>) {
     *group = distinct;
 }
 
+/// The result of a duplicate scan, carrying both accounting metrics (HLD §3.5):
+/// *redundancy* ("how much duplication exists", `len-1` per group — unchanged
+/// meaning) and *removable* ("what this run would actually remove", the victim
+/// count from `select_survivors` under the active policy). The two coincide under
+/// a neutral policy (always one survivor per group).
+struct DuplicateScan {
+    /// Map from hash to a vector of (file path, file size, root index).
+    duplicates: HashMap<String, Vec<DuplicateEntry>>,
+    /// Total number of files walked.
+    scanned_files: usize,
+    /// Redundancy count: `Σ (group.len() - 1)`.
+    redundant_files: usize,
+    /// Redundancy bytes: sizes of the `len-1` redundant copies per group.
+    redundant_bytes: u64,
+    /// Removable count: `Σ select_survivors(group, policy).victims.len()`.
+    removable_files: usize,
+    /// Reclaimable bytes: summed sizes of the victims per group.
+    reclaimable_bytes: u64,
+    /// Elapsed scan time.
+    elapsed: Duration,
+}
+
 /// Scans the directory tree, groups files by size, and then for each group with more than one file,
 /// computes the file hash in parallel. While hashing, a progress indicator shows how many candidate
 /// files have been processed (on a single line in-place).
 ///
-/// Returns:
-/// - A map from hash to a vector of (file path, file size, root index)
-/// - The total number of files scanned
-/// - The duplicate count (excluding the first file in each duplicate group)
-/// - The total wasted space (sum of sizes for duplicate files)
-/// - The elapsed time
+/// Returns a [`DuplicateScan`] carrying the duplicate map, the scanned-file count,
+/// both accounting metric pairs (redundancy and removable, HLD §3.5/§5.5), and the
+/// elapsed time. The `policy` selects survivors for the removable metric and makes
+/// the identity collapse protect-aware (HLD §5.6).
 ///
 /// Each file is tagged with the index of the supplied directory it was
 /// discovered under (0 = first directory). The scanned-file counter and
 /// progress reporting accumulate across all directories; the "Filesystem scan
 /// complete" line is printed once after every directory has been walked.
-#[allow(clippy::type_complexity)]
 fn find_duplicates_in_dirs(
     dirs: &[PathBuf],
     emit_text: bool,
     show_progress: bool,
     follow_symlinks: bool,
-) -> io::Result<(
-    HashMap<String, Vec<DuplicateEntry>>,
-    usize,
-    usize,
-    u64,
-    Duration,
-)> {
+    policy: &KeepPolicy,
+) -> io::Result<DuplicateScan> {
     let start = Instant::now();
     let mut size_map: HashMap<u64, Vec<(PathBuf, usize)>> = HashMap::new();
     let mut scanned_files = 0usize;
@@ -863,25 +919,36 @@ fn find_duplicates_in_dirs(
     // Unix it is also what collapses hardlinks (shared dev+ino) to a single
     // physical file, which must happen regardless of symlink following.
     for group in duplicates.values_mut() {
-        collapse_group_by_identity(group);
+        collapse_group_by_identity(group, policy);
     }
 
     duplicates.retain(|_, group| group.len() > 1);
 
-    let mut duplicate_count = 0;
-    let mut wasted_space = 0;
+    // Two-metric accounting (HLD §3.5/§5.5). Redundancy is the `len-1` formula
+    // (unchanged meaning); removable counts the actual victims under the policy.
+    // Under a neutral policy each group has exactly one survivor, so the two pairs
+    // are identical.
+    let mut redundant_files = 0;
+    let mut redundant_bytes = 0;
+    let mut removable_files = 0;
+    let mut reclaimable_bytes = 0;
     for group in duplicates.values() {
-        duplicate_count += group.len() - 1;
-        wasted_space += group.iter().skip(1).map(|(_, size, _)| *size).sum::<u64>();
+        redundant_files += group.len() - 1;
+        redundant_bytes += group.iter().skip(1).map(|(_, size, _)| *size).sum::<u64>();
+        let (_survivors, victims) = select_survivors(group, policy);
+        removable_files += victims.len();
+        reclaimable_bytes += victims.iter().map(|(_, size, _)| *size).sum::<u64>();
     }
     let elapsed = start.elapsed();
-    Ok((
+    Ok(DuplicateScan {
         duplicates,
         scanned_files,
-        duplicate_count,
-        wasted_space,
+        redundant_files,
+        redundant_bytes,
+        removable_files,
+        reclaimable_bytes,
         elapsed,
-    ))
+    })
 }
 
 /// Returns a unique destination path for moving a file. If a file with the given name
@@ -982,6 +1049,8 @@ struct JsonSummary {
     scanned_files: usize,
     duplicate_files: usize,
     duplicate_wasted_bytes: u64,
+    removable_files: usize,
+    reclaimable_bytes: u64,
     elapsed_seconds: f64,
     follow_symlinks: bool,
     quiet: bool,
@@ -1240,15 +1309,15 @@ fn process_duplicates(
     info_logs: bool,
     error_logs: bool,
 ) -> ProcessReport {
-    // Compute the overall number of duplicate files (excluding the first copy in each group).
-    // This Σ(len-1) formula equals the victim count only under the neutral default
-    // (always exactly one survivor per group). Stage 2's two-metric accounting rework
-    // MUST replace this with the actual victim count from `select_survivors`, since a
-    // protect policy can keep >1 survivor (or all copies) per group (HLD §3.5/§5.5).
+    // Removable total: the number of files this run will actually act on, summed
+    // across groups as the victim count from the shared selection engine (HLD
+    // §3.5/§5.5). Under the neutral default this equals the old Σ(len-1) formula
+    // (exactly one survivor per group); a protect policy can keep >1 survivor (or
+    // all copies), so the count must come from `select_survivors`, not `len-1`.
     let overall_total: usize = duplicates
         .values()
         .filter(|v| v.len() > 1)
-        .map(|v| v.len() - 1)
+        .map(|v| select_survivors(v, policy).1.len())
         .sum();
     let mut report = ProcessReport::new(overall_total);
 
@@ -1351,6 +1420,45 @@ fn process_duplicates(
     report
 }
 
+/// Builds the human-readable scan summary detail line (HLD §3.5). When removable
+/// equals redundancy (the neutral / common case: at most one survivor per group)
+/// the wording is unchanged from Stage 1. Only when protect retains extra
+/// survivors do the metrics diverge, in which case the removable/reclaimable
+/// figures and the protected-and-kept count are additionally reported.
+fn format_scan_summary(
+    scanned: usize,
+    redundant_files: usize,
+    redundant_bytes: u64,
+    removable_files: usize,
+    reclaimable_bytes: u64,
+    elapsed: Duration,
+) -> String {
+    if removable_files == redundant_files {
+        format!(
+            "{} files scanned, {} duplicates found ({} wasted) in {}.",
+            scanned,
+            redundant_files,
+            human_readable(redundant_bytes),
+            format_duration(elapsed)
+        )
+    } else {
+        debug_assert!(
+            removable_files <= redundant_files,
+            "removable cannot exceed redundancy"
+        );
+        format!(
+            "{} files scanned, {} duplicate files ({}); {} removable ({} reclaimable), {} protected and kept, in {}.",
+            scanned,
+            redundant_files,
+            human_readable(redundant_bytes),
+            removable_files,
+            human_readable(reclaimable_bytes),
+            redundant_files.saturating_sub(removable_files),
+            format_duration(elapsed)
+        )
+    }
+}
+
 fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
     install_ctrlc_handler()?;
     reset_cancellation_flag();
@@ -1418,11 +1526,20 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         println!("Starting duplicate scan in: {}", joined);
     }
 
-    let (duplicates, scanned, duplicate_count, wasted, elapsed) = find_duplicates_in_dirs(
+    let DuplicateScan {
+        duplicates,
+        scanned_files: scanned,
+        redundant_files: duplicate_count,
+        redundant_bytes: wasted,
+        removable_files,
+        reclaimable_bytes,
+        elapsed,
+    } = find_duplicates_in_dirs(
         &args.directories,
         summary_stdout,
         show_progress,
         args.follow_symlinks,
+        &keep_policy,
     )?;
     if summary_stdout {
         println!(
@@ -1439,11 +1556,14 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
             .iter()
             .filter(|(_, group)| group.len() > 1)
             .collect();
-        // TODO(Stage 2): once two-metric accounting lands, sort by the actual
-        // victim bytes from `select_survivors` instead of approximating wasted
-        // bytes with `skip(1)` on the raw, unsorted group.
-        groups
-            .sort_by_key(|(_, group)| group.iter().skip(1).map(|(_, size, _)| *size).sum::<u64>());
+        // Sort by the actual reclaimable (victim) bytes under the active policy so
+        // the listing order matches what would be removed, not a `skip(1)`
+        // approximation of the raw group. Under the neutral default this is the
+        // same ordering as before (one survivor per group).
+        groups.sort_by_key(|(_, group)| {
+            let (_survivors, victims) = select_survivors(group, &keep_policy);
+            victims.iter().map(|(_, size, _)| *size).sum::<u64>()
+        });
         for (hash, group) in groups {
             println!(
                 "{}",
@@ -1462,30 +1582,23 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         println!();
     }
 
-    let summary_plain = format!(
-        "Duplicate scan summary: {} files scanned, {} duplicates found ({} wasted) in {}.",
+    // Two-metric summary (HLD §3.5). Under the Stage 2 neutral default the metrics
+    // coincide, so the divergent branch is only reached by unit tests, never the CLI.
+    let summary_detail = format_scan_summary(
         scanned,
         duplicate_count,
-        human_readable(wasted),
-        format_duration(elapsed)
+        wasted,
+        removable_files,
+        reclaimable_bytes,
+        elapsed,
     );
+    let summary_plain = format!("Duplicate scan summary: {}", summary_detail);
     summary_lines.push(summary_plain.clone());
     if summary_stdout {
         println!(
             "{} {}",
             ansi_rgb(173, 216, 230, "Duplicate scan summary:"),
-            ansi_rgb(
-                255,
-                255,
-                224,
-                format!(
-                    "{} files scanned, {} duplicates found ({} wasted) in {}.",
-                    scanned,
-                    duplicate_count,
-                    human_readable(wasted),
-                    format_duration(elapsed)
-                )
-            )
+            ansi_rgb(255, 255, 224, summary_detail)
         );
     }
 
@@ -1609,6 +1722,8 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
             scanned_files: scanned,
             duplicate_files: duplicate_count,
             duplicate_wasted_bytes: wasted,
+            removable_files,
+            reclaimable_bytes,
             elapsed_seconds: elapsed.as_secs_f64(),
             follow_symlinks: args.follow_symlinks,
             quiet: args.quiet,
@@ -1746,7 +1861,11 @@ mod tests {
     }
 
     /// Single-directory convenience wrapper that delegates to the multi-path
-    /// scanner so existing single-directory tests stay unchanged.
+    /// scanner with a neutral policy and flattens the result back to the legacy
+    /// `(duplicates, scanned, redundancy_count, redundancy_bytes, elapsed)` tuple
+    /// so existing single-directory tests stay unchanged. Tests that need the
+    /// removable metrics or a non-neutral policy call `find_duplicates_in_dirs`
+    /// directly.
     #[allow(clippy::type_complexity)]
     fn scan_one(
         dir: &Path,
@@ -1760,7 +1879,20 @@ mod tests {
         u64,
         Duration,
     )> {
-        find_duplicates_in_dirs(&[dir.to_path_buf()], emit_text, show_progress, follow)
+        let scan = find_duplicates_in_dirs(
+            &[dir.to_path_buf()],
+            emit_text,
+            show_progress,
+            follow,
+            &KeepPolicy::default(),
+        )?;
+        Ok((
+            scan.duplicates,
+            scan.scanned_files,
+            scan.redundant_files,
+            scan.redundant_bytes,
+            scan.elapsed,
+        ))
     }
 
     fn set_progress_env() {
@@ -3426,7 +3558,7 @@ mod tests {
         // alias listed under a LATER root_index than the real path; the survivor
         // preference (lowest root_index) must keep the real path entry.
         let mut group: Vec<DuplicateEntry> = vec![(alias.clone(), 7, 1), (real.clone(), 7, 0)];
-        collapse_group_by_identity(&mut group);
+        collapse_group_by_identity(&mut group, &KeepPolicy::default());
 
         assert_eq!(group.len(), 1, "aliased physical file must collapse to one");
         assert_eq!(group[0].2, 0, "lowest root_index entry must be kept");
@@ -3449,7 +3581,7 @@ mod tests {
             (f2.clone(), 7, 0),
             (missing.clone(), 7, 0),
         ];
-        collapse_group_by_identity(&mut group);
+        collapse_group_by_identity(&mut group, &KeepPolicy::default());
 
         assert_eq!(
             group.len(),
@@ -4298,6 +4430,10 @@ mod tests {
 
     #[test]
     fn test_process_duplicates_with_info_logs() {
+        // Holds the progress mutex: this test performs a real Delete action and
+        // reads progress env vars, so it must not race other env/action tests
+        // under parallel `cargo test`.
+        let _guard = lock_progress();
         let temp = TempDir::new().expect("temp dir");
         let file1 = temp.path().join("file1.txt");
         let file2 = temp.path().join("file2.txt");
@@ -5046,6 +5182,7 @@ mod tests {
 
     #[test]
     fn test_process_duplicates_with_move_info_logs() {
+        let _guard = lock_progress();
         let temp = TempDir::new().expect("temp dir");
         let file1 = temp.path().join("file1.txt");
         let file2 = temp.path().join("file2.txt");
@@ -5075,6 +5212,7 @@ mod tests {
 
     #[test]
     fn test_process_duplicates_with_trash_info_logs() {
+        let _guard = lock_progress();
         let temp = TempDir::new().expect("temp dir");
         let file1 = temp.path().join("file1.txt");
         let file2 = temp.path().join("file2.txt");
@@ -6311,5 +6449,183 @@ mod tests {
         assert_eq!(survivor_paths(&survivors), vec![oldest]);
         // Victims are the remaining files in ascending-mtime (chain) order.
         assert_eq!(victim_paths(&victims), vec![middle, newest]);
+    }
+
+    // --- Stage 2: protect-aware collapse + two-metric accounting -----------
+
+    /// Protect-aware identity collapse (HLD §5.6): a physical file reachable both
+    /// through a protected `00-*` directory and through a plain alias must collapse
+    /// to the PROTECTED representative, never the plain one — otherwise the plain
+    /// alias could be acted on and destroy the data the protected marker exists to
+    /// guard. Unix hardlinks share `dev`+`ino`, giving the two paths one `FileId`.
+    /// The plain alias is deliberately given the lower `root_index` so that, absent
+    /// protect-awareness, `survivor_cmp` would (wrongly) keep it.
+    #[test]
+    #[cfg(unix)]
+    fn test_collapse_prefers_protected_alias() {
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::create_dir(dir.join("00-keep")).expect("create protected dir");
+        fs::create_dir(dir.join("plain")).expect("create plain dir");
+        let protected = dir.join("00-keep").join("file.txt");
+        let plain = dir.join("plain").join("file.txt");
+        fs::write(&protected, b"payload").expect("write protected");
+        fs::hard_link(&protected, &plain).expect("hardlink plain alias");
+
+        // Plain alias listed at the lower root_index: under the neutral default it
+        // would win survivor_cmp and be kept. The protect policy must override that.
+        let mut group: Vec<DuplicateEntry> = vec![(plain.clone(), 7, 0), (protected.clone(), 7, 1)];
+        let policy = policy_with(&["0*"], &[], FallbackStrategy::Lexical);
+        collapse_group_by_identity(&mut group, &policy);
+
+        assert_eq!(group.len(), 1, "aliased physical file must collapse to one");
+        assert_eq!(
+            group[0].0, protected,
+            "the protected alias must be the surviving representative"
+        );
+    }
+
+    /// Portable coverage for the protect-preference policy in `prefer_replacement`
+    /// (HLD §5.6), independent of filesystem aliasing. Covers all four
+    /// (incoming, current) protected combinations crossed with both `survivor_cmp`
+    /// outcomes. The protected-vs-unprotected arms must dominate the sort order;
+    /// the both-equal cases fall through to `incoming_sorts_before`.
+    #[test]
+    fn test_prefer_replacement_protect_policy() {
+        // incoming protected, current unprotected: always promote, regardless of sort.
+        assert!(prefer_replacement(true, false, true));
+        assert!(prefer_replacement(true, false, false));
+        // incoming unprotected, current protected: never replace, regardless of sort.
+        assert!(!prefer_replacement(false, true, true));
+        assert!(!prefer_replacement(false, true, false));
+        // both protected: replace iff the incoming alias sorts first.
+        assert!(prefer_replacement(true, true, true));
+        assert!(!prefer_replacement(true, true, false));
+        // both unprotected: replace iff the incoming alias sorts first.
+        assert!(prefer_replacement(false, false, true));
+        assert!(!prefer_replacement(false, false, false));
+    }
+
+    /// Removable < redundancy when a group retains multiple protected survivors
+    /// (HLD §3.4b/§3.5): three byte-identical copies, two under `0*` dirs (both
+    /// kept) and one plain (the lone victim). Redundancy = 2 (len-1); removable = 1.
+    #[test]
+    fn test_metrics_removable_less_than_redundancy() {
+        let _guard = lock_progress();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::create_dir(dir.join("00-a")).expect("create 00-a");
+        fs::create_dir(dir.join("00-b")).expect("create 00-b");
+        fs::create_dir(dir.join("plain")).expect("create plain");
+        fs::write(dir.join("00-a").join("x"), b"same").expect("write a");
+        fs::write(dir.join("00-b").join("x"), b"same").expect("write b");
+        fs::write(dir.join("plain").join("x"), b"same").expect("write plain");
+
+        let policy = policy_with(&["0*"], &[], FallbackStrategy::Lexical);
+        let scan = find_duplicates_in_dirs(&[dir.to_path_buf()], false, false, false, &policy)
+            .expect("scan");
+
+        assert_eq!(
+            scan.redundant_files, 2,
+            "redundancy is len-1 over the group"
+        );
+        assert_eq!(scan.redundant_bytes, 8, "two redundant 4-byte copies");
+        assert_eq!(
+            scan.removable_files, 1,
+            "only the one plain copy is removable"
+        );
+        assert_eq!(scan.reclaimable_bytes, 4, "one removable 4-byte victim");
+    }
+
+    /// An all-protected group is a no-op: removable is 0 but redundancy is > 0
+    /// (HLD §3.5, test 5). Two byte-identical copies, both under `0*` dirs.
+    #[test]
+    fn test_metrics_all_protected_zero_removable() {
+        let _guard = lock_progress();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        fs::create_dir(dir.join("00-a")).expect("create 00-a");
+        fs::create_dir(dir.join("00-b")).expect("create 00-b");
+        fs::write(dir.join("00-a").join("x"), b"same").expect("write a");
+        fs::write(dir.join("00-b").join("x"), b"same").expect("write b");
+
+        let policy = policy_with(&["0*"], &[], FallbackStrategy::Lexical);
+        let scan = find_duplicates_in_dirs(&[dir.to_path_buf()], false, false, false, &policy)
+            .expect("scan");
+
+        assert_eq!(
+            scan.redundant_files, 1,
+            "redundancy still counts the extra copy"
+        );
+        assert!(scan.redundant_bytes > 0, "redundancy bytes are nonzero");
+        assert_eq!(
+            scan.removable_files, 0,
+            "every copy protected -> nothing removable"
+        );
+        assert_eq!(scan.reclaimable_bytes, 0, "nothing reclaimable");
+    }
+
+    /// Neutral parity (HLD §3.3/§3.5): under `KeepPolicy::default()` on a mixed
+    /// tree the two metrics coincide exactly — removable == redundancy and
+    /// reclaimable bytes == redundant bytes — so the CLI summary is unchanged.
+    #[test]
+    fn test_metrics_neutral_parity_on_mixed_tree() {
+        let _guard = lock_progress();
+        let temp = TempDir::new().expect("temp dir");
+        let dir = temp.path();
+        // Group A: three identical copies (would be protected under a 0* policy,
+        // but the neutral default protects nothing).
+        fs::create_dir(dir.join("00-a")).expect("create 00-a");
+        fs::write(dir.join("00-a").join("x"), b"alpha").expect("write a1");
+        fs::write(dir.join("a2.txt"), b"alpha").expect("write a2");
+        fs::write(dir.join("a3.txt"), b"alpha").expect("write a3");
+        // Group B: two identical copies.
+        fs::write(dir.join("b1.txt"), b"beta-content").expect("write b1");
+        fs::write(dir.join("b2.txt"), b"beta-content").expect("write b2");
+        // A unique file (no duplicates).
+        fs::write(dir.join("u.txt"), b"unique-bytes").expect("write u");
+
+        let scan = find_duplicates_in_dirs(
+            &[dir.to_path_buf()],
+            false,
+            false,
+            false,
+            &KeepPolicy::default(),
+        )
+        .expect("scan");
+
+        assert_eq!(scan.redundant_files, 3, "A contributes 2, B contributes 1");
+        assert_eq!(
+            scan.removable_files, scan.redundant_files,
+            "neutral policy: removable == redundancy"
+        );
+        assert_eq!(
+            scan.reclaimable_bytes, scan.redundant_bytes,
+            "neutral policy: reclaimable bytes == redundant bytes"
+        );
+    }
+
+    /// Equal/common case (HLD §3.5): when removable == redundancy the summary
+    /// wording must be byte-identical to the Stage 1 output so existing behavior
+    /// and snapshot expectations are unchanged.
+    #[test]
+    fn test_format_scan_summary_equal_case() {
+        let line = format_scan_summary(100, 12, 4096, 12, 4096, Duration::from_secs(5));
+        assert_eq!(
+            line,
+            "100 files scanned, 12 duplicates found (4.00 KB wasted) in 5 sec."
+        );
+    }
+
+    /// Divergent case (HLD §3.5): when protect retains extras, removable and
+    /// reclaimable are reported alongside the protected-and-kept count
+    /// (redundancy − removable = 12 − 9 = 3, matching the HLD example).
+    #[test]
+    fn test_format_scan_summary_divergent_case() {
+        let line = format_scan_summary(100, 12, 4096, 9, 3072, Duration::from_secs(5));
+        assert_eq!(
+            line,
+            "100 files scanned, 12 duplicate files (4.00 KB); 9 removable (3.00 KB reclaimable), 3 protected and kept, in 5 sec."
+        );
     }
 }

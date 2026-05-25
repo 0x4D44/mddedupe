@@ -128,6 +128,19 @@ fn cli_json_summary_outputs_valid_json() {
         1,
         "duplicate count should match"
     );
+    // Two-metric accounting (HLD §3.5): under the neutral default the removable
+    // metric equals the redundancy metric, so both new fields are present and
+    // mirror duplicate_files / duplicate_wasted_bytes.
+    assert_eq!(
+        summary["removable_files"].as_u64().unwrap(),
+        1,
+        "removable_files should equal duplicate_files under the neutral default"
+    );
+    assert_eq!(
+        summary["reclaimable_bytes"].as_u64().unwrap(),
+        summary["duplicate_wasted_bytes"].as_u64().unwrap(),
+        "reclaimable_bytes should equal duplicate_wasted_bytes under the neutral default"
+    );
     assert_eq!(
         summary["summary_format"].as_str().unwrap(),
         "json",
@@ -139,6 +152,11 @@ fn cli_json_summary_outputs_valid_json() {
     let file_json: Value =
         serde_json::from_str(file_contents.trim()).expect("summary file should contain JSON");
     assert_eq!(file_json["duplicate_files"].as_u64().unwrap(), 1);
+    assert_eq!(file_json["removable_files"].as_u64().unwrap(), 1);
+    assert_eq!(
+        file_json["reclaimable_bytes"].as_u64().unwrap(),
+        file_json["duplicate_wasted_bytes"].as_u64().unwrap()
+    );
 }
 
 #[test]
