@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -37,6 +38,213 @@ fn survivor_cmp(a: &DuplicateEntry, b: &DuplicateEntry) -> std::cmp::Ordering {
     let (path_a, _, root_a) = a;
     let (path_b, _, root_b) = b;
     root_a.cmp(root_b).then_with(|| path_a.cmp(path_b))
+}
+
+/// Tie-break strategy used to pick the survivor of an unprotected duplicate group
+/// (i.e. when no copy is protected). Sits between `root_index` and the final
+/// `path` tiebreak in the fallback chain (HLD §3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum FallbackStrategy {
+    /// Keep the copy with the earliest modification time.
+    Oldest,
+    /// Keep the copy with the latest modification time.
+    Newest,
+    /// Keep the copy with the fewest path components.
+    Shortest,
+    /// No additional key; `root_index` then `path` decide (today's behavior).
+    Lexical,
+}
+
+/// User-configurable survivor-selection policy (HLD §5.1). Protect rules exclude
+/// matching files from action entirely; the fallback strategy picks the keeper
+/// for groups where nothing is protected.
+struct KeepPolicy {
+    /// Matched against each ancestor directory component name.
+    protect_dir: GlobSet,
+    /// Matched against the file name.
+    protect_name: GlobSet,
+    /// Tie-break strategy for unprotected groups.
+    fallback: FallbackStrategy,
+}
+
+impl Default for KeepPolicy {
+    /// NEUTRAL default: nothing is protected and `Lexical` fallback reproduces
+    /// today's `survivor_cmp` behavior exactly (`root_index → ∅ → path`).
+    fn default() -> Self {
+        Self {
+            protect_dir: GlobSet::empty(),
+            protect_name: GlobSet::empty(),
+            fallback: FallbackStrategy::Lexical,
+        }
+    }
+}
+
+/// Why a file was retained as a survivor of its duplicate group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurvivorReason {
+    /// An ancestor directory component matched a `protect_dir` glob.
+    ProtectedDir,
+    /// The file name matched a `protect_name` glob.
+    ProtectedName,
+    /// No copy was protected; selected by the fallback chain.
+    Fallback,
+}
+
+/// Compiles a list of glob patterns into a `GlobSet`, matching each pattern
+/// case-insensitively. Used by tests now and by config/CLI policy resolution in
+/// a later stage (hence `allow(dead_code)` until that call site lands).
+#[allow(dead_code)]
+fn build_globset(patterns: &[String]) -> Result<GlobSet, globset::Error> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(GlobBuilder::new(pattern).case_insensitive(true).build()?);
+    }
+    builder.build()
+}
+
+/// Reads a path's modification time, or `None` if it cannot be read. An
+/// unreadable mtime is treated as "newest" by the fallback comparators so it
+/// loses the "oldest" contest; the `path` tiebreak still guarantees a total order.
+fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Returns true if any ancestor directory component name of `path` matches
+/// `set`. Matching is performed against each single component string via
+/// `to_string_lossy`, so path separators are irrelevant (HLD §5.7).
+fn any_ancestor_dir_matches(path: &Path, set: &GlobSet) -> bool {
+    // The final component is the file itself; only directory components count.
+    let components: Vec<_> = path.components().collect();
+    let dir_count = components.len().saturating_sub(1);
+    components.iter().take(dir_count).any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        set.is_match(name.as_ref())
+    })
+}
+
+/// Returns true if the file name of `path` matches `set`.
+fn file_name_matches(path: &Path, set: &GlobSet) -> bool {
+    match path.file_name() {
+        Some(name) => set.is_match(name.to_string_lossy().as_ref()),
+        None => false,
+    }
+}
+
+/// Splits a duplicate group into survivors (kept, with reason) and victims (to
+/// act on), per the "protect, then fall back" model (HLD §3.1, §5.2). This is the
+/// single source of truth shared by the action and display call sites so the two
+/// can never drift. (`collapse_group_by_identity` still uses `survivor_cmp`
+/// directly and is left protect-unaware until Stage 3 — HLD §5.6.)
+///
+/// With `KeepPolicy::default()` (empty globs, `Lexical`) nothing is ever
+/// protected, so the result is the `survivor_cmp`-first element as the sole
+/// survivor and the rest as victims — identical to today's `sort_by(survivor_cmp)`
+/// + `skip(1)`.
+///
+/// An empty group yields `(vec![], vec![])`; a singleton group yields that one
+/// entry as the sole survivor with no victims.
+fn select_survivors<'a>(
+    group: &'a [DuplicateEntry],
+    policy: &KeepPolicy,
+) -> (
+    Vec<(&'a DuplicateEntry, SurvivorReason)>,
+    Vec<&'a DuplicateEntry>,
+) {
+    if group.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut survivors: Vec<(&DuplicateEntry, SurvivorReason)> = Vec::new();
+    let mut unprotected: Vec<&DuplicateEntry> = Vec::new();
+
+    for entry in group {
+        let path = entry.0.as_path();
+        if any_ancestor_dir_matches(path, &policy.protect_dir) {
+            survivors.push((entry, SurvivorReason::ProtectedDir));
+        } else if file_name_matches(path, &policy.protect_name) {
+            survivors.push((entry, SurvivorReason::ProtectedName));
+        } else {
+            unprotected.push(entry);
+        }
+    }
+
+    if !survivors.is_empty() {
+        // At least one copy is protected: keep all protected copies, remove the
+        // rest. If every copy is protected, there are no victims (group untouched).
+        return (survivors, unprotected);
+    }
+
+    // Nothing protected: pick the single best file by the fallback chain
+    // (root_index → strategy key → path) and remove the rest. For the mtime
+    // strategies, read each file's mtime exactly once into a sort key before
+    // sorting, so the comparator never touches the filesystem (and the order
+    // stays a consistent total order even if a file changes mid-sort).
+    let mut keyed: Vec<(Option<std::time::SystemTime>, &DuplicateEntry)> = unprotected
+        .into_iter()
+        .map(|entry| {
+            let key = match policy.fallback {
+                FallbackStrategy::Oldest | FallbackStrategy::Newest => mtime_of(entry.0.as_path()),
+                FallbackStrategy::Lexical | FallbackStrategy::Shortest => None,
+            };
+            (key, entry)
+        })
+        .collect();
+    keyed.sort_by(|(key_a, a), (key_b, b)| fallback_cmp(*key_a, a, *key_b, b, policy.fallback));
+    let mut victims: Vec<&DuplicateEntry> = keyed.into_iter().map(|(_, entry)| entry).collect();
+    let keeper = victims.remove(0);
+    (vec![(keeper, SurvivorReason::Fallback)], victims)
+}
+
+/// The fallback chain comparator (HLD §3.1): `root_index → strategy key → path`.
+/// Guarantees a total order so selection is deterministic. The mtime keys are
+/// precomputed by the caller (see `select_survivors`) so this performs no I/O.
+fn fallback_cmp(
+    mtime_a: Option<std::time::SystemTime>,
+    a: &DuplicateEntry,
+    mtime_b: Option<std::time::SystemTime>,
+    b: &DuplicateEntry,
+    strategy: FallbackStrategy,
+) -> std::cmp::Ordering {
+    let (path_a, _, root_a) = a;
+    let (path_b, _, root_b) = b;
+    root_a
+        .cmp(root_b)
+        .then_with(|| fallback_strategy_cmp(path_a, mtime_a, path_b, mtime_b, strategy))
+        .then_with(|| path_a.cmp(path_b))
+}
+
+/// The strategy-specific key of the fallback chain. `Lexical` is a no-op so the
+/// surrounding `root_index`/`path` keys decide alone. The mtime strategies use
+/// the precomputed `mtime_a`/`mtime_b` keys rather than re-reading the files.
+fn fallback_strategy_cmp(
+    a: &Path,
+    mtime_a: Option<std::time::SystemTime>,
+    b: &Path,
+    mtime_b: Option<std::time::SystemTime>,
+    strategy: FallbackStrategy,
+) -> std::cmp::Ordering {
+    match strategy {
+        FallbackStrategy::Lexical => std::cmp::Ordering::Equal,
+        FallbackStrategy::Shortest => a.components().count().cmp(&b.components().count()),
+        FallbackStrategy::Oldest | FallbackStrategy::Newest => {
+            // An unreadable mtime is treated as newest, so it loses the "oldest"
+            // contest and wins the "newest" one. `Option` orders `None < Some`,
+            // which is the opposite of "newest", so order by `Some(t)` ascending
+            // and treat `None` as greater than every real time.
+            let cmp_oldest =
+                |x: Option<std::time::SystemTime>, y: Option<std::time::SystemTime>| match (x, y) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                };
+            match strategy {
+                // Swap the args to reverse the order: the largest mtime sorts first.
+                FallbackStrategy::Newest => cmp_oldest(mtime_b, mtime_a),
+                _ => cmp_oldest(mtime_a, mtime_b),
+            }
+        }
+    }
 }
 
 /// A tool to scan one or more directory trees and identify duplicate files.
@@ -1028,10 +1236,15 @@ impl From<io::Error> for AppError {
 fn process_duplicates(
     duplicates: &HashMap<String, Vec<DuplicateEntry>>,
     action: &DuplicateAction,
+    policy: &KeepPolicy,
     info_logs: bool,
     error_logs: bool,
 ) -> ProcessReport {
-    // Compute the overall number of duplicate files (excluding the first copy in each group)
+    // Compute the overall number of duplicate files (excluding the first copy in each group).
+    // This Σ(len-1) formula equals the victim count only under the neutral default
+    // (always exactly one survivor per group). Stage 2's two-metric accounting rework
+    // MUST replace this with the actual victim count from `select_survivors`, since a
+    // protect policy can keep >1 survivor (or all copies) per group (HLD §3.5/§5.5).
     let overall_total: usize = duplicates
         .values()
         .filter(|v| v.len() > 1)
@@ -1043,27 +1256,38 @@ fn process_duplicates(
         if files.len() <= 1 {
             continue;
         }
-        // Keep the survivor on the earliest-listed directory; ties fall back to
-        // alphabetical path order.
-        let mut sorted_files = files.clone();
-        sorted_files.sort_by(survivor_cmp);
+        // Partition the group via the shared selection engine: survivors are kept,
+        // victims are acted on. Under the neutral default this is exactly the old
+        // `survivor_cmp`-first survivor + `skip(1)` victims.
+        let (survivors, victims) = select_survivors(files, policy);
         if info_logs {
             println!(
                 "{}",
                 ansi_fixed(8, format!("Duplicate group (hash: {}):", hash))
             );
-            for (i, (path, size, _)) in sorted_files.iter().enumerate() {
+            let mut index = 1;
+            for ((path, size, _), _reason) in &survivors {
                 println!(
                     "  {}: {} ({})",
-                    i + 1,
+                    index,
                     path.display(),
                     human_readable(*size)
                 );
+                index += 1;
+            }
+            for (path, size, _) in &victims {
+                println!(
+                    "  {}: {} ({})",
+                    index,
+                    path.display(),
+                    human_readable(*size)
+                );
+                index += 1;
             }
         }
 
-        // Process duplicate group: skip the first file.
-        for (path, size, _) in sorted_files.iter().skip(1) {
+        // Act on the victims (the survivors are retained).
+        for (path, size, _) in &victims {
             if cancellation_requested() {
                 return report;
             }
@@ -1138,6 +1362,10 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
         return Err(AppError::OverlappingPaths(outer, inner));
     }
 
+    // Stage 1: neutral selection policy (today's behavior). Config/CLI resolution
+    // arrives in a later stage; the engine already supports protect rules.
+    let keep_policy = KeepPolicy::default();
+
     let summary_stdout = args.summary_format == SummaryFormat::Text && !args.summary_silent;
     let log_output = !args.summary_only && !args.quiet && matches!(args.log_level, LogLevel::Info);
     let warn_logs = !args.summary_only
@@ -1211,6 +1439,9 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
             .iter()
             .filter(|(_, group)| group.len() > 1)
             .collect();
+        // TODO(Stage 2): once two-metric accounting lands, sort by the actual
+        // victim bytes from `select_survivors` instead of approximating wasted
+        // bytes with `skip(1)` on the raw, unsorted group.
         groups
             .sort_by_key(|(_, group)| group.iter().skip(1).map(|(_, size, _)| *size).sum::<u64>());
         for (hash, group) in groups {
@@ -1218,10 +1449,13 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
                 "{}",
                 ansi_fixed(8, format!("Duplicate group (hash: {}):", hash))
             );
-            // Print the survivor first by sorting each group by (root_index, path).
-            let mut sorted_group = group.clone();
-            sorted_group.sort_by(survivor_cmp);
-            for (path, size, _) in &sorted_group {
+            // Print survivors first, then victims, using the shared selection
+            // engine so the displayed and executed decisions can never drift.
+            let (survivors, victims) = select_survivors(group, &keep_policy);
+            for ((path, size, _), _reason) in &survivors {
+                println!("  {} ({})", path.display(), human_readable(*size));
+            }
+            for (path, size, _) in &victims {
                 println!("  {} ({})", path.display(), human_readable(*size));
             }
         }
@@ -1288,7 +1522,7 @@ fn run_app<R: BufRead>(args: Args, mut input: R) -> Result<(), AppError> {
             }
         }
 
-        let report = process_duplicates(&duplicates, &action, log_output, error_logs);
+        let report = process_duplicates(&duplicates, &action, &keep_policy, log_output, error_logs);
 
         if cancellation_requested() {
             return Err(AppError::Cancelled);
@@ -2067,6 +2301,7 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Move(dest_dir.clone()),
+            &KeepPolicy::default(),
             true,
             true,
         );
@@ -2783,7 +3018,13 @@ mod tests {
             ],
         );
 
-        let report = process_duplicates(&duplicates, &DuplicateAction::Delete, true, true);
+        let report = process_duplicates(
+            &duplicates,
+            &DuplicateAction::Delete,
+            &KeepPolicy::default(),
+            true,
+            true,
+        );
         assert_eq!(report.successes, 1);
         assert!(report.failures.is_empty());
         // The first file remains, the duplicate is deleted.
@@ -2836,6 +3077,7 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Move(move_dest_path.clone()),
+            &KeepPolicy::default(),
             true,
             true,
         );
@@ -2891,7 +3133,13 @@ mod tests {
         let trash_path = trash_dir.path().join("files");
         env::set_var("MDD_TRASH_DIR", &trash_path);
 
-        let report = process_duplicates(&duplicates, &DuplicateAction::Trash, true, true);
+        let report = process_duplicates(
+            &duplicates,
+            &DuplicateAction::Trash,
+            &KeepPolicy::default(),
+            true,
+            true,
+        );
         assert_eq!(report.successes, 1);
         assert!(report.failures.is_empty());
 
@@ -2949,6 +3197,7 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Move(dest_path.to_path_buf()),
+            &KeepPolicy::default(),
             true,
             true,
         );
@@ -2979,7 +3228,13 @@ mod tests {
             ],
         );
 
-        let report = process_duplicates(&duplicates, &DuplicateAction::Delete, true, true);
+        let report = process_duplicates(
+            &duplicates,
+            &DuplicateAction::Delete,
+            &KeepPolicy::default(),
+            true,
+            true,
+        );
         assert_eq!(report.successes, 0);
     }
 
@@ -3688,6 +3943,7 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Move(dest_dir.clone()),
+            &KeepPolicy::default(),
             false, // info_logs = false
             false, // error_logs = false
         );
@@ -4059,6 +4315,7 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Delete,
+            &KeepPolicy::default(),
             true, // info_logs = true
             true, // error_logs = true
         );
@@ -4618,6 +4875,7 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Move(dest.path().to_path_buf()),
+            &KeepPolicy::default(),
             false,
             true, // error_logs = true to hit eprintln path
         );
@@ -4807,6 +5065,7 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Move(dest.path().to_path_buf()),
+            &KeepPolicy::default(),
             true, // info_logs = true
             true, // error_logs = true
         );
@@ -4837,6 +5096,7 @@ mod tests {
         let report = process_duplicates(
             &duplicates,
             &DuplicateAction::Trash,
+            &KeepPolicy::default(),
             true, // info_logs = true
             true, // error_logs = true
         );
@@ -5762,5 +6022,294 @@ mod tests {
             b"cross device payload",
             "relocated content must match"
         );
+    }
+
+    // --- select_survivors / KeepPolicy (Stage 1) ---------------------------
+
+    /// Builds a `DuplicateEntry` from a path string with a fixed size and the
+    /// given root index. `select_survivors` only inspects the path for protect
+    /// matching, so the file need not exist for protect/lexical/shortest tests.
+    fn entry(path: &str, root_index: usize) -> DuplicateEntry {
+        (PathBuf::from(path), 100u64, root_index)
+    }
+
+    fn policy_with(dir: &[&str], name: &[&str], fallback: FallbackStrategy) -> KeepPolicy {
+        let to_vec = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        KeepPolicy {
+            protect_dir: build_globset(&to_vec(dir)).expect("dir globset"),
+            protect_name: build_globset(&to_vec(name)).expect("name globset"),
+            fallback,
+        }
+    }
+
+    fn survivor_paths(survivors: &[(&DuplicateEntry, SurvivorReason)]) -> Vec<PathBuf> {
+        survivors.iter().map(|(e, _)| e.0.clone()).collect()
+    }
+
+    fn victim_paths(victims: &[&DuplicateEntry]) -> Vec<PathBuf> {
+        victims.iter().map(|e| e.0.clone()).collect()
+    }
+
+    #[test]
+    fn test_select_survivors_protect_by_dir() {
+        let group = vec![
+            entry("/pix/00-keep/img.jpg", 0),
+            entry("/pix/2020/img.jpg", 0),
+            entry("/pix/tmp/img copy.jpg", 0),
+        ];
+        let policy = policy_with(&["0*"], &[], FallbackStrategy::Oldest);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivor_paths(&survivors), vec![group[0].0.clone()]);
+        assert_eq!(survivors[0].1, SurvivorReason::ProtectedDir);
+        assert_eq!(
+            victim_paths(&victims),
+            vec![group[1].0.clone(), group[2].0.clone()]
+        );
+    }
+
+    #[test]
+    fn test_select_survivors_protect_by_name() {
+        let group = vec![entry("/a/plain.txt", 0), entry("/b/00 - master.txt", 0)];
+        let policy = policy_with(&[], &["00-*", "00 - *"], FallbackStrategy::Lexical);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivor_paths(&survivors), vec![group[1].0.clone()]);
+        assert_eq!(survivors[0].1, SurvivorReason::ProtectedName);
+        assert_eq!(victim_paths(&victims), vec![group[0].0.clone()]);
+    }
+
+    #[test]
+    fn test_select_survivors_dir_first_reason_when_both_match() {
+        // First file matches BOTH a dir glob (00-keep) and a name glob (00-*);
+        // the dir rule is tested first so its label wins (HLD §3.2). The second
+        // file matches neither, so it is the lone victim.
+        let group = vec![
+            entry("/pix/00-keep/00-img.jpg", 0),
+            entry("/pix/2020/img.jpg", 0),
+        ];
+        let policy = policy_with(&["0*"], &["00-*"], FallbackStrategy::Lexical);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].1, SurvivorReason::ProtectedDir);
+        assert_eq!(victim_paths(&victims), vec![group[1].0.clone()]);
+    }
+
+    #[test]
+    fn test_select_survivors_multiple_protected_all_survive() {
+        let group = vec![entry("/00-a/x", 0), entry("/00-b/x", 0), entry("/c/x", 0)];
+        let policy = policy_with(&["0*"], &[], FallbackStrategy::Lexical);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(
+            survivor_paths(&survivors),
+            vec![group[0].0.clone(), group[1].0.clone()]
+        );
+        assert!(survivors
+            .iter()
+            .all(|(_, r)| *r == SurvivorReason::ProtectedDir));
+        assert_eq!(victim_paths(&victims), vec![group[2].0.clone()]);
+    }
+
+    #[test]
+    fn test_select_survivors_all_protected_zero_victims() {
+        let group = vec![entry("/00-a/x", 0), entry("/00-b/x", 0)];
+        let policy = policy_with(&["0*"], &[], FallbackStrategy::Lexical);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivors.len(), 2);
+        assert!(victims.is_empty());
+    }
+
+    #[test]
+    fn test_select_survivors_no_match_oldest() {
+        let _guard = lock_progress();
+        let temp = TempDir::new().expect("temp dir");
+        let old = temp.path().join("old.txt");
+        let new = temp.path().join("new.txt");
+        fs::write(&old, b"same").expect("write old");
+        fs::write(&new, b"same").expect("write new");
+        // Set explicit, distinct mtimes so the strategy is deterministic.
+        filetime::set_file_mtime(&old, filetime::FileTime::from_unix_time(1_000, 0))
+            .expect("set old mtime");
+        filetime::set_file_mtime(&new, filetime::FileTime::from_unix_time(2_000, 0))
+            .expect("set new mtime");
+        // List `new` first so a no-op strategy would keep it; `oldest` must keep `old`.
+        let group = vec![(new.clone(), 4u64, 0usize), (old.clone(), 4u64, 0usize)];
+        let policy = policy_with(&[], &[], FallbackStrategy::Oldest);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivor_paths(&survivors), vec![old.clone()]);
+        assert_eq!(survivors[0].1, SurvivorReason::Fallback);
+        assert_eq!(victim_paths(&victims), vec![new]);
+    }
+
+    #[test]
+    fn test_select_survivors_no_match_newest() {
+        let _guard = lock_progress();
+        let temp = TempDir::new().expect("temp dir");
+        let old = temp.path().join("old.txt");
+        let new = temp.path().join("new.txt");
+        fs::write(&old, b"same").expect("write old");
+        fs::write(&new, b"same").expect("write new");
+        filetime::set_file_mtime(&old, filetime::FileTime::from_unix_time(1_000, 0))
+            .expect("set old mtime");
+        filetime::set_file_mtime(&new, filetime::FileTime::from_unix_time(2_000, 0))
+            .expect("set new mtime");
+        // List `old` first; `newest` must still keep `new`.
+        let group = vec![(old.clone(), 4u64, 0usize), (new.clone(), 4u64, 0usize)];
+        let policy = policy_with(&[], &[], FallbackStrategy::Newest);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivor_paths(&survivors), vec![new]);
+        assert_eq!(victim_paths(&victims), vec![old]);
+    }
+
+    #[test]
+    fn test_select_survivors_shortest() {
+        // Fewest path components wins; list the longer path first to prove the
+        // strategy reorders.
+        let group = vec![entry("/a/b/c/deep.txt", 0), entry("/a/short.txt", 0)];
+        let policy = policy_with(&[], &[], FallbackStrategy::Shortest);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivor_paths(&survivors), vec![group[1].0.clone()]);
+        assert_eq!(victim_paths(&victims), vec![group[0].0.clone()]);
+    }
+
+    #[test]
+    fn test_select_survivors_lexical() {
+        // No strategy key: within equal root_index the path tiebreak decides.
+        let group = vec![entry("/z/x.txt", 0), entry("/a/x.txt", 0)];
+        let policy = policy_with(&[], &[], FallbackStrategy::Lexical);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivor_paths(&survivors), vec![group[1].0.clone()]);
+        assert_eq!(victim_paths(&victims), vec![group[0].0.clone()]);
+    }
+
+    #[test]
+    fn test_select_survivors_case_insensitive_match() {
+        // `00-FOO` (uppercase) matches `00-*` case-insensitively, via the dir rule.
+        let group = vec![entry("/root/00-FOO/img.jpg", 0)];
+        let policy = policy_with(&["00-*"], &[], FallbackStrategy::Lexical);
+        let (survivors, _victims) = select_survivors(&group, &policy);
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].1, SurvivorReason::ProtectedDir);
+    }
+
+    #[test]
+    fn test_select_survivors_ancestor_match_deep_path() {
+        // A file deep under a `00-best` directory is protected by `0*`.
+        let group = vec![
+            entry("/root/00-best/sub/deeper/x.bin", 0),
+            entry("/root/other/x.bin", 0),
+        ];
+        let policy = policy_with(&["0*"], &[], FallbackStrategy::Lexical);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivor_paths(&survivors), vec![group[0].0.clone()]);
+        assert_eq!(survivors[0].1, SurvivorReason::ProtectedDir);
+        assert_eq!(victim_paths(&victims), vec![group[1].0.clone()]);
+    }
+
+    #[test]
+    fn test_select_survivors_equal_mtime_falls_to_path() {
+        let _guard = lock_progress();
+        let temp = TempDir::new().expect("temp dir");
+        let a = temp.path().join("a.txt");
+        let b = temp.path().join("b.txt");
+        fs::write(&a, b"same").expect("write a");
+        fs::write(&b, b"same").expect("write b");
+        // Identical mtimes: the path tiebreak must decide deterministically.
+        let t = filetime::FileTime::from_unix_time(1_500, 0);
+        filetime::set_file_mtime(&a, t).expect("set a mtime");
+        filetime::set_file_mtime(&b, t).expect("set b mtime");
+        // List `b` first; oldest is a tie, so path order keeps `a`.
+        let group = vec![(b.clone(), 4u64, 0usize), (a.clone(), 4u64, 0usize)];
+        let policy = policy_with(&[], &[], FallbackStrategy::Oldest);
+        let (survivors, victims) = select_survivors(&group, &policy);
+        assert_eq!(survivor_paths(&survivors), vec![a]);
+        assert_eq!(victim_paths(&victims), vec![b]);
+    }
+
+    #[test]
+    fn test_select_survivors_neutral_default_matches_survivor_cmp() {
+        // The critical invariant: under KeepPolicy::default(), select_survivors
+        // yields exactly the survivor_cmp-first element + the rest as victims.
+        let group = vec![
+            entry("/p1/c.txt", 1),
+            entry("/p0/z.txt", 0),
+            entry("/p0/a.txt", 0),
+        ];
+        let mut expected = group.clone();
+        expected.sort_by(survivor_cmp);
+
+        let (survivors, victims) = select_survivors(&group, &KeepPolicy::default());
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].1, SurvivorReason::Fallback);
+        assert_eq!(survivors[0].0 .0, expected[0].0);
+        assert_eq!(
+            victim_paths(&victims),
+            expected[1..]
+                .iter()
+                .map(|e| e.0.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_select_survivors_unreadable_mtime_sentinel() {
+        // One real file with a known mtime, one path that does not exist on disk
+        // (its mtime is unreadable -> None -> treated as "newest"). The ghost path
+        // sorts lexically *before* the real path, so if the None ordering were
+        // flipped (or collapsed to Equal) the path tiebreak would hand the ghost
+        // the survivor slot and these assertions would fail.
+        let _guard = lock_progress();
+        let temp = TempDir::new().expect("temp dir");
+        let real = temp.path().join("zzz_real.txt");
+        let ghost = temp.path().join("aaa_ghost.txt");
+        fs::write(&real, b"same").expect("write real");
+        filetime::set_file_mtime(&real, filetime::FileTime::from_unix_time(1_000, 0))
+            .expect("set real mtime");
+        assert!(!ghost.exists(), "ghost path must not exist");
+
+        // Oldest: the unreadable ghost is treated as newest, so the real file wins.
+        let group = vec![(ghost.clone(), 4u64, 0usize), (real.clone(), 4u64, 0usize)];
+        let (survivors, victims) =
+            select_survivors(&group, &policy_with(&[], &[], FallbackStrategy::Oldest));
+        assert_eq!(survivor_paths(&survivors), vec![real.clone()]);
+        assert_eq!(victim_paths(&victims), vec![ghost.clone()]);
+
+        // Newest: the unreadable ghost is treated as newest, so the ghost wins.
+        let (survivors, victims) =
+            select_survivors(&group, &policy_with(&[], &[], FallbackStrategy::Newest));
+        assert_eq!(survivor_paths(&survivors), vec![ghost]);
+        assert_eq!(victim_paths(&victims), vec![real]);
+    }
+
+    #[test]
+    fn test_select_survivors_fallback_victim_order_three_files() {
+        // A no-protect group of three files resolved by `Oldest`. The survivor is
+        // not the first input element, and the victims must come out in the
+        // fallback chain order (ascending mtime, then path), not merely as the
+        // right set — victim order feeds downstream move-collision renaming.
+        let _guard = lock_progress();
+        let temp = TempDir::new().expect("temp dir");
+        let oldest = temp.path().join("oldest.txt");
+        let middle = temp.path().join("middle.txt");
+        let newest = temp.path().join("newest.txt");
+        for f in [&oldest, &middle, &newest] {
+            fs::write(f, b"same").expect("write file");
+        }
+        filetime::set_file_mtime(&oldest, filetime::FileTime::from_unix_time(1_000, 0))
+            .expect("set oldest mtime");
+        filetime::set_file_mtime(&middle, filetime::FileTime::from_unix_time(2_000, 0))
+            .expect("set middle mtime");
+        filetime::set_file_mtime(&newest, filetime::FileTime::from_unix_time(3_000, 0))
+            .expect("set newest mtime");
+
+        // Input order deliberately does NOT lead with the survivor (`oldest`).
+        let group = vec![
+            (newest.clone(), 4u64, 0usize),
+            (middle.clone(), 4u64, 0usize),
+            (oldest.clone(), 4u64, 0usize),
+        ];
+        let (survivors, victims) =
+            select_survivors(&group, &policy_with(&[], &[], FallbackStrategy::Oldest));
+        assert_eq!(survivor_paths(&survivors), vec![oldest]);
+        // Victims are the remaining files in ascending-mtime (chain) order.
+        assert_eq!(victim_paths(&victims), vec![middle, newest]);
     }
 }
